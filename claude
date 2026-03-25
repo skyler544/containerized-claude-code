@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Wrapper that runs Claude CLI inside a Docker container.
+# Drop this in ~/bin/claude (or any directory on your PATH) and chmod +x it.
+#
+# Usage: claude [any claude-code args]
+#   e.g. claude
+#        claude --help
+#        claude "explain this codebase"
+#
+# Build the image with:
+#   docker build --build-arg HOST_UID=$(id -u) -t claude-cli:latest "$HOME/build/programming/claude/"
+
+set -euo pipefail
+
+IMAGE_NAME="claude-cli"
+IMAGE_TAG="latest"
+
+# ── Auth state ───────────────────────────────────────────────────────────────
+# First-time setup: after running this wrapper, if you aren't logged in yet,
+# run claude and go through the setup menu.
+# That will guide you through authenticating, and with the mounted directory your auth setup should be persisted.
+CLAUDE_HOME="$HOME/build/programming/claude/claude-home"
+
+# ── Workspace ─────────────────────────────────────────────────────────────────
+# The host directory that gets mounted into the container.
+# Claude can only read/write files under this path — nothing else on the host.
+HOST_WORKSPACE="$HOME/workspace"
+
+# Derive the equivalent in-container path from the current working directory.
+# The workspace is mounted at ~/workspace inside the container
+if [[ "$PWD" == "$HOST_WORKSPACE"* ]]; then
+    CONTAINER_WORKDIR="/home/claude/workspace${PWD#$HOST_WORKSPACE}"
+else
+    CONTAINER_WORKDIR="/home/claude/workspace"
+fi
+
+# ── TTY detection ─────────────────────────────────────────────────────────────
+# Pass -it only when stdin is a real terminal (interactive session).
+# Without this, piping into claude (e.g. echo "..." | claude) would break.
+TTY_FLAGS=()
+if [[ -t 0 ]]; then
+    TTY_FLAGS=(-it)
+fi
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+exec docker run \
+    "${TTY_FLAGS[@]}" \
+    --rm \
+    --network=host \
+    -v "$CLAUDE_HOME:/home/claude" \
+    -v "$HOST_WORKSPACE:/home/claude/workspace" \
+    --workdir "$CONTAINER_WORKDIR" \
+    "$IMAGE_NAME:$IMAGE_TAG" \
+    "$@"
