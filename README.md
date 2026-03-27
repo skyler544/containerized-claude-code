@@ -1,22 +1,12 @@
 ### Containerized Claude Code
+This is a mostly vibe-coded proof-of-concept debian container for Claude Code. No guarantees that this is good at all 🤣 That said, it works so far!
 
-This is a mostly vibe-coded proof-of-concept debian container for Claude Code.
-
-No guarantees that this is good at all 🤣
-
-This consists of a Dockerfile and a wrapper `claude` script for starting claude inside the container in a subdirectory of your mounted workspace.
+The project consists of a `Dockerfile` and a `claude` wrapper script. The wrapper script gives `claude` a dedicated home directory mounted to `$HOME/.cache/claude-home/` where it can output all of its many json files. The host's current working directory is mounted to `/home/claude/workspace/` in the container.
 
 ### Setup
-I've restricted it to my workspace directory, and the path to this repository is also hardcoded in the wrapper script. If you want to try this you can use my structure but you will probably want to change these paths:
-
-- Projects directory: `~/workspace`
-- Repo location: `~/build/programming/claude`
-
-After cloning you should run `mkdir -p $REPO_LOCATION/claude-home/workspace` to make the workspace directory for the container.
-
-Next, build the container: `docker build --build-arg HOST_UID=$(id -u) -t claude-cli:latest "$HOME/build/programming/claude/"`
-
-Finally, symlink the wrapper script: `ln -s $REPO_LOCATION/claude $HOME/.local/bin/claude`
+- Build the container: `./rebuild-claude-container`
+- Symlink the wrapper script: `ln -s $REPO_LOCATION/claude $HOME/.local/bin/claude`
+- If needed, mark the script as executable: `chmod +x $REPO_LOCATION/claude`
 
 ### Usage
-The oauth flow should happen automatically when you run `claude` but you will probably need to manually copy/paste the auth link and auth token.
+Run `claude` from any directory you want to work in. The oauth flow should happen automatically on first run, but you may need to manually copy/paste the auth link and token.
