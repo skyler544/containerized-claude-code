@@ -1,29 +1,24 @@
-FROM debian:trixie
+FROM alpine:latest
 
 # Install only the CLI tools you want Claude to have access to.
-RUN apt update && apt install -y --no-install-recommends \
+RUN apk add --no-cache \
     ca-certificates \
-    composer \
     curl \
-    jq \
-    && rm -rf /var/lib/apt/lists/*
+    bash
 
-# The install script drops the binary into /root/.local/bin/claude, so
-# symlink it into /usr/local/bin so it's on $PATH for everyone
+# must install as root, otherwise the bind mount of the claude home dir will overwrite the binary
 RUN curl -fsSL https://claude.ai/install.sh | bash \
     && ln -s /root/.local/bin/claude /usr/local/bin/claude
 
-# Create a non-root user so Claude can't modify system files even inside the container
-# Match this UID to your host user's UID (run 'id youruser' on the host to check).
-# This ensures the container user can read/write bind-mounted files.
+# run claude as a non-root user, with a UID that matches the host's user so it
+# can read/write non-system files
 ARG HOST_UID=1000
-RUN useradd -m -u $HOST_UID claude
-
-# without this claude complains every time you run it, probably because it tries
-# to update itself
-ENV PATH="/home/claude/.local/bin:$PATH"
-
+RUN adduser -D -u $HOST_UID claude
 USER claude
+
 WORKDIR /home/claude/workspace
 
-ENTRYPOINT ["claude"]
+# stop claude complaining about not being on path
+ENV PATH="/home/claude/.local/bin:$PATH"
+
+ENTRYPOINT ["/usr/local/bin/claude"]

@@ -1,5 +1,5 @@
 ### Containerized Claude Code
-This is a mostly vibe-coded proof-of-concept debian container for Claude Code. No guarantees that this is good at all 🤣 That said, it works so far!
+This is a proof-of-concept container for Claude Code. No guarantees that this is good at all 🤣 That said, it works so far!
 
 The project consists of a `Dockerfile` and a `claude` wrapper script. The wrapper script gives `claude` a dedicated home directory mounted to `$HOME/.cache/claude-home/` where it can output all of its many json files. The host's current working directory is mounted to `/home/claude/workspace/` in the container.
 
