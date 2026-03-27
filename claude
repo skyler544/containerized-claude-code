@@ -18,9 +18,10 @@ IMAGE_TAG="latest"
 CLAUDE_HOME="$HOME/.cache/claude-home"
 
 # ── Workspace ─────────────────────────────────────────────────────────────────
-# Mount the current working directory into the container
+# Mount the current working directory into the container as ~/workspace/<dirname>
 HOST_WORKDIR="$PWD"
-CONTAINER_WORKDIR="/home/claude/workspace"
+PROJECT_NAME="$(basename "$PWD")"
+CONTAINER_WORKDIR="/home/claude/workspace/$PROJECT_NAME"
 
 # ── TTY detection ─────────────────────────────────────────────────────────────
 # Pass -it only when stdin is a real terminal (interactive session).
