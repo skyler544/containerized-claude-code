@@ -13,9 +13,18 @@ IMAGE_NAME="claude-cli"
 IMAGE_TAG="latest"
 
 # ── Auth state ───────────────────────────────────────────────────────────────
-# First-time setup: after running this wrapper, if you aren't logged in yet,
-# run claude and go through the setup menu.
+# Claude home dir is bind-mounted for session config, but credentials are kept
+# in a separate read-only location and injected via a dedicated bind mount so
+# that they are never writable from inside the container.
+#
+# Layout expected on the host:
+#   ~/.cache/claude-home/        – mutable session state (settings, history …)
+#   ~/.cache/claude-credentials/ – read-only auth tokens (.claude/credentials.json)
+#
+# First-time setup: run  mkdir -p ~/.cache/claude-credentials/.claude
+# then copy (or move) ~/.cache/claude-home/.claude/credentials.json there.
 CLAUDE_HOME="$HOME/.cache/claude-home"
+CLAUDE_CREDS_DIR="$HOME/.cache/claude-credentials"
 
 # ── Workspace ─────────────────────────────────────────────────────────────────
 # Mount the current working directory into the container as ~/workspace/<dirname>
@@ -35,9 +44,14 @@ fi
 exec docker run \
     "${TTY_FLAGS[@]}" \
     --rm \
-    --network=host \
+    --network=bridge \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges:true \
     -v "$CLAUDE_HOME:/home/claude" \
+    -v "$CLAUDE_CREDS_DIR/.claude/credentials.json:/home/claude/.claude/credentials.json:ro" \
     -v "$HOST_WORKDIR:$CONTAINER_WORKDIR" \
+    -v "$HOME/planning:$CONTAINER_WORKDIR/planning" \
+    --tmpfs "$CONTAINER_WORKDIR/planning/.git:noexec,nosuid,nodev" \
     --workdir "$CONTAINER_WORKDIR" \
     "$IMAGE_NAME:$IMAGE_TAG" \
     "$@"

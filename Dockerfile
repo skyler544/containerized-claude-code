@@ -8,7 +8,8 @@ RUN apk add --no-cache \
 
 # must install as root, otherwise the bind mount of the claude home dir will overwrite the binary
 RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && ln -s /root/.local/bin/claude /usr/local/bin/claude
+    && cp /root/.local/bin/claude /usr/local/bin/claude \
+    && chmod 755 /usr/local/bin/claude
 
 # run claude as a non-root user, with a UID that matches the host's user so it
 # can read/write non-system files
