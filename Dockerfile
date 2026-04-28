@@ -4,7 +4,8 @@ FROM alpine:latest
 RUN apk add --no-cache \
     ca-certificates \
     curl \
-    bash
+    bash \
+    git
 
 # must install as root, otherwise the bind mount of the claude home dir will overwrite the binary
 RUN curl -fsSL https://claude.ai/install.sh | bash \

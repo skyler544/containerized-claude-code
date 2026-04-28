@@ -40,6 +40,15 @@ if [[ -t 0 ]]; then
     TTY_FLAGS=(-it)
 fi
 
+# ── Git read-only mount ────────────────────────────────────────────────────────
+# If the workspace has a .git dir, mount it read-only so git log/diff/status
+# work but git add/commit/push always fail with a permission error.
+# Skipped when there is no .git to avoid Docker creating a spurious empty dir.
+GIT_MOUNT=()
+if [[ -d "$HOST_WORKDIR/.git" ]]; then
+    GIT_MOUNT=(-v "$HOST_WORKDIR/.git:$CONTAINER_WORKDIR/.git:ro")
+fi
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 exec docker run \
     "${TTY_FLAGS[@]}" \
@@ -50,6 +59,7 @@ exec docker run \
     -v "$CLAUDE_HOME:/home/claude" \
     -v "$CLAUDE_CREDS_DIR/.claude/credentials.json:/home/claude/.claude/credentials.json:ro" \
     -v "$HOST_WORKDIR:$CONTAINER_WORKDIR" \
+    "${GIT_MOUNT[@]}" \
     -v "$HOME/planning:$CONTAINER_WORKDIR/planning" \
     --tmpfs "$CONTAINER_WORKDIR/planning/.git:noexec,nosuid,nodev" \
     --workdir "$CONTAINER_WORKDIR" \
