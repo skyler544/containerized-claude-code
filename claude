@@ -32,6 +32,14 @@ HOST_WORKDIR="$PWD"
 PROJECT_NAME="$(basename "$PWD")"
 CONTAINER_WORKDIR="/home/claude/workspace/$PROJECT_NAME"
 
+# ── SELinux ───────────────────────────────────────────────────────────────────
+# :Z relabeling requires the SELinux kernel module to be loaded. When SELinux is
+# fully disabled (not just permissive), lsetxattr fails with EPERM.
+Z=""
+if [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
+    Z=",z"
+fi
+
 # ── TTY detection ─────────────────────────────────────────────────────────────
 # Pass -it only when stdin is a real terminal (interactive session).
 # Without this, piping into claude (e.g. echo "..." | claude) would break.
@@ -46,21 +54,21 @@ fi
 # Skipped when there is no .git to avoid Docker creating a spurious empty dir.
 GIT_MOUNT=()
 if [[ -d "$HOST_WORKDIR/.git" ]]; then
-    GIT_MOUNT=(-v "$HOST_WORKDIR/.git:$CONTAINER_WORKDIR/.git:ro")
+    GIT_MOUNT=(-v "$HOST_WORKDIR/.git:$CONTAINER_WORKDIR/.git:ro$Z")
 fi
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-exec docker run \
+exec podman run \
     "${TTY_FLAGS[@]}" \
     --rm \
-    --network=bridge \
+    --userns=keep-id \
     --cap-drop=ALL \
     --security-opt=no-new-privileges:true \
-    -v "$CLAUDE_HOME:/home/claude" \
-    -v "$CLAUDE_CREDS_DIR/.claude/credentials.json:/home/claude/.claude/credentials.json:ro" \
-    -v "$HOST_WORKDIR:$CONTAINER_WORKDIR" \
+    -v "$CLAUDE_HOME:/home/claude$Z" \
+    -v "$CLAUDE_CREDS_DIR/.claude/credentials.json:/home/claude/.claude/credentials.json:ro$Z" \
+    -v "$HOST_WORKDIR:$CONTAINER_WORKDIR$Z" \
     "${GIT_MOUNT[@]}" \
-    -v "$HOME/planning:$CONTAINER_WORKDIR/planning" \
+    -v "$HOME/planning:$CONTAINER_WORKDIR/planning$Z" \
     --tmpfs "$CONTAINER_WORKDIR/planning/.git:noexec,nosuid,nodev" \
     --workdir "$CONTAINER_WORKDIR" \
     "$IMAGE_NAME:$IMAGE_TAG" \

@@ -12,10 +12,9 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
     && cp /root/.local/bin/claude /usr/local/bin/claude \
     && chmod 755 /usr/local/bin/claude
 
-# run claude as a non-root user, with a UID that matches the host's user so it
-# can read/write non-system files
-ARG HOST_UID=1000
-RUN adduser -D -u $HOST_UID claude
+# run claude as a non-root user; --userns=keep-id in the launcher maps the host
+# user's UID to the same UID inside the container
+RUN adduser -D claude
 USER claude
 
 WORKDIR /home/claude/workspace
