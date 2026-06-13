@@ -6,7 +6,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="${CODEX_IMAGE_NAME:-codex-cli}"
 IMAGE_TAG="${CODEX_IMAGE_TAG:-latest}"
-COMMAND="${1:?usage: run-codex-container COMMAND [ARGS...]}"
+
+KEEP_STDIN_OPEN=false
+if [[ "${1:-}" == "--keep-stdin-open" ]]; then
+	KEEP_STDIN_OPEN=true
+	shift
+fi
+
+COMMAND="${1:?usage: run-codex-container [--keep-stdin-open] COMMAND [ARGS...]}"
 shift
 
 CODEX_HOME_HOST="${CODEX_HOME_HOST:-$HOME/.cache/codex-home}"
@@ -23,9 +30,12 @@ if [[ -f "$GLOBAL_AGENTS_SRC" ]]; then
 	fi
 fi
 
-TTY_FLAGS=(-i)
+TTY_FLAGS=()
+if [[ "$KEEP_STDIN_OPEN" == true ]]; then
+	TTY_FLAGS=(-i)
+fi
 if [[ -t 0 && -t 1 ]]; then
-	TTY_FLAGS+=(-t)
+	TTY_FLAGS=(-it)
 fi
 
 # A second bind mount over the workspace's .git makes it read-only even though
