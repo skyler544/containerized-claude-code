@@ -23,9 +23,9 @@ if [[ -f "$GLOBAL_AGENTS_SRC" ]]; then
     fi
 fi
 
-TTY_FLAGS=()
+TTY_FLAGS=(-i)
 if [[ -t 0 && -t 1 ]]; then
-    TTY_FLAGS=(-it)
+    TTY_FLAGS+=(-t)
 fi
 
 # A second bind mount over the workspace's .git makes it read-only even though
