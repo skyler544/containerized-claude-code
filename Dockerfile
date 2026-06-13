@@ -1,25 +1,44 @@
+FROM alpine:latest AS installer
+
+RUN apk add --no-cache \
+    nodejs \
+    npm
+
+RUN npm install -g \
+    @openai/codex \
+    @zed-industries/codex-acp \
+    && mkdir /out \
+    && find /usr/local/lib/node_modules -type f -name codex -exec cp '{}' /out/codex ';' \
+    && find /usr/local/lib/node_modules -type f -name codex-acp -exec cp '{}' /out/codex-acp ';' \
+    && test -x /out/codex \
+    && test -x /out/codex-acp
+
 FROM alpine:latest
 
-# Install only the CLI tools you want Claude to have access to.
+# Install only tools that should be available to Codex at runtime.
 RUN apk add --no-cache \
+    bash \
+    bubblewrap \
     ca-certificates \
     curl \
-    bash \
-    git
+    git \
+    ripgrep
 
-# must install as root, otherwise the bind mount of the claude home dir will overwrite the binary
-RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && cp /root/.local/bin/claude /usr/local/bin/claude \
-    && chmod 755 /usr/local/bin/claude
+COPY --from=installer /out/codex /usr/local/bin/codex
+COPY --from=installer /out/codex-acp /usr/local/bin/codex-acp
 
-# run claude as a non-root user; --userns=keep-id in the launcher maps the host
-# user's UID to the same UID inside the container
-RUN adduser -D claude
-USER claude
+COPY managed_config.toml /etc/codex/managed_config.toml
+RUN test -x /usr/local/bin/codex \
+    && test -x /usr/local/bin/codex-acp \
+    && test -f /etc/codex/managed_config.toml \
+    && ! command -v node \
+    && ! command -v npm
 
-WORKDIR /home/claude/workspace
+# --userns=keep-id in the launcher maps the host user's UID/GID to this user.
+RUN adduser -D codex
+USER codex
 
-# stop claude complaining about not being on path
-ENV PATH="/home/claude/.local/bin:$PATH"
+ENV CODEX_HOME=/home/codex/.codex
+WORKDIR /workspace
 
-ENTRYPOINT ["/usr/local/bin/claude"]
+CMD ["codex"]

@@ -1,5 +1,0 @@
-#!/bin/bash
-
-podman build --no-cache \
-    --tag claude-cli:latest \
-    "$HOME/build/programming/claude"

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Shared container launcher for the Codex CLI and ACP wrappers.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE_NAME="${CODEX_IMAGE_NAME:-codex-cli}"
+IMAGE_TAG="${CODEX_IMAGE_TAG:-latest}"
+COMMAND="${1:?usage: run-codex-container COMMAND [ARGS...]}"
+shift
+
+CODEX_HOME_HOST="${CODEX_HOME_HOST:-$HOME/.cache/codex-home}"
+HOST_WORKDIR="$PWD"
+CONTAINER_WORKDIR="$HOST_WORKDIR"
+GLOBAL_AGENTS_SRC="$SCRIPT_DIR/AGENTS.md"
+GLOBAL_AGENTS_DEST="$CODEX_HOME_HOST/AGENTS.md"
+
+mkdir -p "$CODEX_HOME_HOST"
+
+if [[ -f "$GLOBAL_AGENTS_SRC" ]]; then
+    if [[ ! -e "$GLOBAL_AGENTS_DEST" || "$GLOBAL_AGENTS_SRC" -nt "$GLOBAL_AGENTS_DEST" ]]; then
+        cp "$GLOBAL_AGENTS_SRC" "$GLOBAL_AGENTS_DEST"
+    fi
+fi
+
+TTY_FLAGS=()
+if [[ -t 0 && -t 1 ]]; then
+    TTY_FLAGS=(-it)
+fi
+
+# A second bind mount over the workspace's .git makes it read-only even though
+# the rest of the workspace is writable. Also supports worktree-style .git files.
+GIT_MOUNT=()
+if [[ -e "$HOST_WORKDIR/.git" ]]; then
+    GIT_MOUNT=(-v "$HOST_WORKDIR/.git:$CONTAINER_WORKDIR/.git:ro,z")
+fi
+
+PLANNING_MOUNTS=()
+if [[ -d "$HOME/planning" ]]; then
+    PLANNING_MOUNTS=(-v "$HOME/planning:$HOME/planning:z")
+    if [[ -e "$HOME/planning/.git" ]]; then
+        PLANNING_MOUNTS+=(
+            -v "$HOME/planning/.git:$HOME/planning/.git:ro,z"
+        )
+    fi
+fi
+
+exec podman run \
+    "${TTY_FLAGS[@]}" \
+    --rm \
+    --userns=keep-id \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges:true \
+    --env GIT_OPTIONAL_LOCKS=0 \
+    -v "$CODEX_HOME_HOST:/home/codex/.codex:z" \
+    -v "$HOST_WORKDIR:$CONTAINER_WORKDIR:z" \
+    "${GIT_MOUNT[@]}" \
+    "${PLANNING_MOUNTS[@]}" \
+    --workdir "$CONTAINER_WORKDIR" \
+    "$IMAGE_NAME:$IMAGE_TAG" \
+    "$COMMAND" \
+    "$@"
