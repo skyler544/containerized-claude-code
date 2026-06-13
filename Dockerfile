@@ -1,9 +1,7 @@
-FROM alpine:latest AS installer
+FROM node:22-bookworm-slim AS installer
 
-RUN apk add --no-cache \
-    nodejs \
-    npm
-
+# Keep installer and runtime on glibc: npm may select a GNU codex-acp binary,
+# which Alpine cannot execute even though the file exists and is executable.
 RUN npm install -g \
     @openai/codex \
     @zed-industries/codex-acp \
@@ -13,16 +11,18 @@ RUN npm install -g \
     && test -x /out/codex \
     && test -x /out/codex-acp
 
-FROM alpine:latest
+FROM debian:bookworm-slim
 
 # Install only tools that should be available to Codex at runtime.
-RUN apk add --no-cache \
-    bash \
-    bubblewrap \
-    ca-certificates \
-    curl \
-    git \
-    ripgrep
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        bash \
+        bubblewrap \
+        ca-certificates \
+        curl \
+        git \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=installer /out/codex /usr/local/bin/codex
 COPY --from=installer /out/codex-acp /usr/local/bin/codex-acp
@@ -35,7 +35,7 @@ RUN test -x /usr/local/bin/codex \
     && ! command -v npm
 
 # --userns=keep-id in the launcher maps the host user's UID/GID to this user.
-RUN adduser -D codex
+RUN useradd --create-home --shell /bin/bash codex
 USER codex
 
 ENV CODEX_HOME=/home/codex/.codex
