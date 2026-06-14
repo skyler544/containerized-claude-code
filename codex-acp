@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run the Codex ACP adapter in the same container and workspace as Codex CLI.
-
 set -euo pipefail
 
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
-SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
-exec "$SCRIPT_DIR/run-codex-container" --keep-stdin-open codex-acp "$@"
+SCRIPT_DIR="$HOME/build/programming/containerized-agents/"
+exec "$SCRIPT_DIR/run-codex-container" \
+	--keep-stdin-open \
+	codex-acp \
+	"$@"
