@@ -47,12 +47,7 @@ fi
 
 PLANNING_MOUNTS=()
 if [[ -d "$HOME/planning" ]]; then
-	PLANNING_MOUNTS=(-v "$HOME/planning:$HOME/planning")
-	if [[ -e "$HOME/planning/.git" ]]; then
-		PLANNING_MOUNTS+=(
-			-v "$HOME/planning/.git:$HOME/planning/.git:ro"
-		)
-	fi
+	PLANNING_MOUNTS=(-v "$HOME/planning:$CONTAINER_WORKDIR/planning:ro")
 fi
 
 PODMAN_RUN=(

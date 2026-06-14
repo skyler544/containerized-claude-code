@@ -33,16 +33,15 @@ Codex gets global instructions without overriding any project-local `AGENTS.md`.
 `codex-acp` uses the same image, state, current-directory workspace, and mount
 policy. It communicates over stdio, so an ACP client should launch the wrapper
 directly. The workspace and optional planning directory are mounted at their
-exact host paths so absolute paths exchanged over ACP also resolve on the host.
+workspace paths so absolute project paths exchanged over ACP also resolve on the
+host.
 The wrapper keeps container stdin open while the ACP client is connected and
 stops the container when the wrapper is closed or signaled.
 
 Both wrappers:
 
-- use `:z` on every bind mount for SELinux compatibility;
 - overlay an existing workspace `.git` path read-only;
-- mount `$HOME/planning` only when it exists, with its `.git` read-only when
-  present;
+- mount `$HOME/planning` read-only at `<workspace>/planning` when it exists;
 - run rootless with the host UID/GID, all capabilities dropped, and
   `no-new-privileges`.
 
