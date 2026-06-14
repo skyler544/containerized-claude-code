@@ -1,48 +1,41 @@
 # Containerized Codex
 
-This project provides small Podman wrappers for Codex and the Codex ACP
-adapter. Run a wrapper from a project directory and that directory is mounted
-as the container's writable workspace.
+## What?
 
-## Setup
+This repository runs the Codex CLI and Codex ACP adapter inside a rootless Podman container, mounting the host's current directory as the workspace.
+- `codex` runs the interactive Codex CLI.
+- `codex-acp` runs the stdio-based ACP adapter.
 
-The same image contains both `codex` and `codex-acp`:
+## Why?
+
+Codex is allowed to execute commands without approval prompts or its own nested sandbox. The host is protected by the containerization and the explicit workspace context mounted inside it.
+
+## How?
+
+The wrappers expect this repository at `$HOME/build/programming/containerized-agents`. Use this path or change the scripts to match your setup. Build the shared image and add the wrappers to your path:
 
 ```sh
 ./rebuild-codex-container
-ln -s "$REPO_LOCATION/codex" "$HOME/.local/bin/codex"
-ln -s "$REPO_LOCATION/codex-acp" "$HOME/.local/bin/codex-acp"
+ln -s "$HOME/build/programming/containerized-agents/codex" "$HOME/.local/bin/codex"
+ln -s "$HOME/build/programming/containerized-agents/codex-acp" "$HOME/.local/bin/codex-acp"
 ```
 
-Both are native Rust binaries. Node.js and npm are used only in an intermediate
-image stage to retrieve the binaries and are not present in the runtime image.
+Run `codex` from the project directory you want it to edit:
 
-Run `codex` from any directory you want to work in. Its authentication,
-configuration, sessions, and other state are persisted under
-`$HOME/.cache/codex-home` by default.
+```sh
+cd "$PROJECT"
+codex
+```
 
-The image's managed Codex configuration sets approval policy to `never` and
-sandbox mode to `danger-full-access`, so both wrappers execute commands without
-approval prompts or Codex's own nested sandbox. The `codex` wrapper also passes
-`--dangerously-bypass-approvals-and-sandbox` explicitly. The Podman container,
-restricted mounts, and read-only Git metadata are the safety boundary instead.
+Each invocation:
 
-On startup the launcher copies the repo's `AGENTS.md` into that Codex home so
-Codex gets global instructions without overriding any project-local `AGENTS.md`.
+- mounts the current directory into the container as read-write;
+- overlays the workspace's `.git` path read-only when it exists;
+- mounts `$HOME/planning` read-only at `<workspace>/planning` when it exists;
+- mounts `$HOME/.cache/codex-home` for Codex's state files;
+- copies this repository's `AGENTS.md` into that persistent home when newer;
+- runs with the host UID/GID, all capabilities dropped, and no new privileges.
 
-`codex-acp` uses the same image, state, current-directory workspace, and mount
-policy. It communicates over stdio, so an ACP client should launch the wrapper
-directly. The workspace and optional planning directory are mounted at their
-workspace paths so absolute project paths exchanged over ACP also resolve on the
-host.
-The wrapper keeps container stdin open while the ACP client is connected and
-stops the container when the wrapper is closed or signaled.
+The managed Codex configuration disables approval prompts and Codex's sandbox. The `codex` wrapper also passes `--dangerously-bypass-approvals-and-sandbox`.
 
-Both wrappers:
-
-- overlay an existing workspace `.git` path read-only;
-- mount `$HOME/planning` read-only at `<workspace>/planning` when it exists;
-- run rootless with the host UID/GID, all capabilities dropped, and
-  `no-new-privileges`.
-
-Set `CODEX_HOME_HOST` to use a different persistent host state directory.
+`codex-acp` uses the same workspace and mounts, keeps container stdin attached for ACP communication, and stops the container when the ACP client exits or the wrapper is signaled. Known to work with [xenodium/agent-shell](https://github.com/xenodium/agent-shell); other ACP clients may or may not work as expected.
