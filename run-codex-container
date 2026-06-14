@@ -55,19 +55,59 @@ if [[ -d "$HOME/planning" ]]; then
 	fi
 fi
 
-exec podman run \
-	"${TTY_FLAGS[@]}" \
-	--rm \
-	--userns=keep-id \
-	--cap-drop=ALL \
-	--security-opt=no-new-privileges:true \
-	--security-opt=label=disable \
-	--env GIT_OPTIONAL_LOCKS=0 \
-	-v "$CODEX_HOME_HOST:/home/codex/.codex" \
-	-v "$HOST_WORKDIR:$CONTAINER_WORKDIR" \
-	"${GIT_MOUNT[@]}" \
-	"${PLANNING_MOUNTS[@]}" \
-	--workdir "$CONTAINER_WORKDIR" \
-	"$IMAGE_NAME:$IMAGE_TAG" \
-	"$COMMAND" \
+PODMAN_RUN=(
+	podman run
+	"${TTY_FLAGS[@]}"
+	--rm
+	--userns=keep-id
+	--cap-drop=ALL
+	--security-opt=no-new-privileges:true
+	--security-opt=label=disable
+	--env GIT_OPTIONAL_LOCKS=0
+	-v "$CODEX_HOME_HOST:/home/codex/.codex"
+	-v "$HOST_WORKDIR:$CONTAINER_WORKDIR"
+	"${GIT_MOUNT[@]}"
+	"${PLANNING_MOUNTS[@]}"
+	--workdir "$CONTAINER_WORKDIR"
+	"$IMAGE_NAME:$IMAGE_TAG"
+	"$COMMAND"
 	"$@"
+)
+
+if [[ "$KEEP_STDIN_OPEN" != true ]]; then
+	exec "${PODMAN_RUN[@]}"
+fi
+
+# Podman's -i keeps the container's stdin open even after its attached client
+# exits. Supervise that client so closing an ACP client also stops the container.
+CID_DIR="$(mktemp -d)"
+CID_FILE="$CID_DIR/container-id"
+PODMAN_PID=
+
+cleanup() {
+	local container_id=
+
+	trap - EXIT HUP INT TERM
+	if [[ -n "$PODMAN_PID" ]]; then
+		kill "$PODMAN_PID" 2>/dev/null || true
+	fi
+	if [[ -s "$CID_FILE" ]]; then
+		container_id="$(<"$CID_FILE")"
+		podman stop --ignore --time 1 "$container_id" >/dev/null 2>&1 || true
+	fi
+	if [[ -n "$PODMAN_PID" ]]; then
+		wait "$PODMAN_PID" 2>/dev/null || true
+	fi
+	rm -rf "$CID_DIR"
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+exec 3<&0
+"${PODMAN_RUN[@]:0:2}" --cidfile "$CID_FILE" "${PODMAN_RUN[@]:2}" <&3 &
+PODMAN_PID=$!
+exec 3<&-
+wait "$PODMAN_PID"

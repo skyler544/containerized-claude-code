@@ -34,6 +34,8 @@ Codex gets global instructions without overriding any project-local `AGENTS.md`.
 policy. It communicates over stdio, so an ACP client should launch the wrapper
 directly. The workspace and optional planning directory are mounted at their
 exact host paths so absolute paths exchanged over ACP also resolve on the host.
+The wrapper keeps container stdin open while the ACP client is connected and
+stops the container when the wrapper is closed or signaled.
 
 Both wrappers:
 
