@@ -1,33 +1,25 @@
 #!/usr/bin/env bash
-# Shared container launcher for the Codex CLI and ACP wrappers.
-
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE_NAME="${CODEX_IMAGE_NAME:-codex-cli}"
-IMAGE_TAG="${CODEX_IMAGE_TAG:-latest}"
-
+SCRIPT_DIR="$HOME/build/programming/containerized-agents/"
 KEEP_STDIN_OPEN=false
 if [[ "${1:-}" == "--keep-stdin-open" ]]; then
 	KEEP_STDIN_OPEN=true
 	shift
 fi
 
-COMMAND="${1:?usage: run-codex-container [--keep-stdin-open] COMMAND [ARGS...]}"
+COMMAND="${1:?missing command}"
 shift
 
-CODEX_HOME_HOST="${CODEX_HOME_HOST:-$HOME/.cache/codex-home}"
-HOST_WORKDIR="$PWD"
-CONTAINER_WORKDIR="$HOST_WORKDIR"
+CODEX_HOME_HOST="$HOME/.cache/codex-home"
+WORKDIR="$PWD"
 GLOBAL_AGENTS_SRC="$SCRIPT_DIR/AGENTS.md"
 GLOBAL_AGENTS_DEST="$CODEX_HOME_HOST/AGENTS.md"
 
 mkdir -p "$CODEX_HOME_HOST"
 
-if [[ -f "$GLOBAL_AGENTS_SRC" ]]; then
-	if [[ ! -e "$GLOBAL_AGENTS_DEST" || "$GLOBAL_AGENTS_SRC" -nt "$GLOBAL_AGENTS_DEST" ]]; then
-		cp "$GLOBAL_AGENTS_SRC" "$GLOBAL_AGENTS_DEST"
-	fi
+if [[ ! -e "$GLOBAL_AGENTS_DEST" || "$GLOBAL_AGENTS_SRC" -nt "$GLOBAL_AGENTS_DEST" ]]; then
+	cp "$GLOBAL_AGENTS_SRC" "$GLOBAL_AGENTS_DEST"
 fi
 
 TTY_FLAGS=()
@@ -38,16 +30,15 @@ if [[ -t 0 && -t 1 ]]; then
 	TTY_FLAGS=(-it)
 fi
 
-# A second bind mount over the workspace's .git makes it read-only even though
-# the rest of the workspace is writable. Also supports worktree-style .git files.
+# Bind mount the workspace's .git as read-only
 GIT_MOUNT=()
-if [[ -e "$HOST_WORKDIR/.git" ]]; then
-	GIT_MOUNT=(-v "$HOST_WORKDIR/.git:$CONTAINER_WORKDIR/.git:ro")
+if [[ -e "$WORKDIR/.git" ]]; then
+	GIT_MOUNT=(-v "$WORKDIR/.git:$WORKDIR/.git:ro")
 fi
 
 PLANNING_MOUNTS=()
 if [[ -d "$HOME/planning" ]]; then
-	PLANNING_MOUNTS=(-v "$HOME/planning:$CONTAINER_WORKDIR/planning:ro")
+	PLANNING_MOUNTS=(-v "$HOME/planning:$WORKDIR/planning:ro")
 fi
 
 PODMAN_RUN=(
@@ -60,11 +51,11 @@ PODMAN_RUN=(
 	--security-opt=label=disable
 	--env GIT_OPTIONAL_LOCKS=0
 	-v "$CODEX_HOME_HOST:/home/codex/.codex"
-	-v "$HOST_WORKDIR:$CONTAINER_WORKDIR"
+	-v "$WORKDIR:$WORKDIR"
 	"${GIT_MOUNT[@]}"
 	"${PLANNING_MOUNTS[@]}"
-	--workdir "$CONTAINER_WORKDIR"
-	"$IMAGE_NAME:$IMAGE_TAG"
+	--workdir "$WORKDIR"
+	"codex-cli:latest"
 	"$COMMAND"
 	"$@"
 )
