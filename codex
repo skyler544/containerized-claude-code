@@ -3,6 +3,4 @@ set -euo pipefail
 
 SCRIPT_DIR="$HOME/build/programming/containerized-agents/"
 exec "$SCRIPT_DIR/run-codex-container" \
-	codex \
-	--dangerously-bypass-approvals-and-sandbox \
 	"$@"

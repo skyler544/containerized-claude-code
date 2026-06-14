@@ -2,98 +2,126 @@
 set -euo pipefail
 
 SCRIPT_DIR="$HOME/build/programming/containerized-agents/"
-KEEP_STDIN_OPEN=false
-if [[ "${1:-}" == "--keep-stdin-open" ]]; then
-	KEEP_STDIN_OPEN=true
+RUN_ACP=false
+if [[ "${1:-}" == "--acp" ]]; then
+	RUN_ACP=true
 	shift
 fi
 
-COMMAND="${1:?missing command}"
-shift
-
 CODEX_HOME_HOST="$HOME/.cache/codex-home"
 WORKDIR="$PWD"
-GLOBAL_AGENTS_SRC="$SCRIPT_DIR/AGENTS.md"
-GLOBAL_AGENTS_DEST="$CODEX_HOME_HOST/AGENTS.md"
+COMMON_PODMAN_ARGS=()
 
-mkdir -p "$CODEX_HOME_HOST"
+prepare_codex_home() {
+	local global_agents_src="$SCRIPT_DIR/AGENTS.md"
+	local global_agents_dest="$CODEX_HOME_HOST/AGENTS.md"
 
-if [[ ! -e "$GLOBAL_AGENTS_DEST" || "$GLOBAL_AGENTS_SRC" -nt "$GLOBAL_AGENTS_DEST" ]]; then
-	cp "$GLOBAL_AGENTS_SRC" "$GLOBAL_AGENTS_DEST"
-fi
+	mkdir -p "$CODEX_HOME_HOST"
 
-TTY_FLAGS=()
-if [[ "$KEEP_STDIN_OPEN" == true ]]; then
-	TTY_FLAGS=(-i)
-fi
-if [[ -t 0 && -t 1 ]]; then
-	TTY_FLAGS=(-it)
-fi
+	if [[ ! -e "$global_agents_dest" || "$global_agents_src" -nt "$global_agents_dest" ]]; then
+		cp "$global_agents_src" "$global_agents_dest"
+	fi
+}
 
-# Bind mount the workspace's .git as read-only
-GIT_MOUNT=()
-if [[ -e "$WORKDIR/.git" ]]; then
-	GIT_MOUNT=(-v "$WORKDIR/.git:$WORKDIR/.git:ro")
-fi
+prepare_common_podman_args() {
+	COMMON_PODMAN_ARGS=(
+		--rm
+		--userns=keep-id
+		--cap-drop=ALL
+		--security-opt=no-new-privileges:true
+		--security-opt=label=disable
+		--env GIT_OPTIONAL_LOCKS=0
+		-v "$CODEX_HOME_HOST:/home/codex/.codex"
+		-v "$WORKDIR:$WORKDIR"
+	)
 
-PLANNING_MOUNTS=()
-if [[ -d "$HOME/planning" ]]; then
-	PLANNING_MOUNTS=(-v "$HOME/planning:$WORKDIR/planning:ro")
-fi
+	# Bind mount the workspace's Git metadata as read-only.
+	if [[ -e "$WORKDIR/.git" ]]; then
+		COMMON_PODMAN_ARGS+=(-v "$WORKDIR/.git:$WORKDIR/.git:ro")
+	fi
 
-PODMAN_RUN=(
-	podman run
-	"${TTY_FLAGS[@]}"
-	--rm
-	--userns=keep-id
-	--cap-drop=ALL
-	--security-opt=no-new-privileges:true
-	--security-opt=label=disable
-	--env GIT_OPTIONAL_LOCKS=0
-	-v "$CODEX_HOME_HOST:/home/codex/.codex"
-	-v "$WORKDIR:$WORKDIR"
-	"${GIT_MOUNT[@]}"
-	"${PLANNING_MOUNTS[@]}"
-	--workdir "$WORKDIR"
-	"codex-cli:latest"
-	"$COMMAND"
-	"$@"
-)
+	if [[ -d "$HOME/planning" ]]; then
+		COMMON_PODMAN_ARGS+=(-v "$HOME/planning:$WORKDIR/planning:ro")
+	fi
 
-if [[ "$KEEP_STDIN_OPEN" != true ]]; then
-	exec "${PODMAN_RUN[@]}"
-fi
+	COMMON_PODMAN_ARGS+=(--workdir "$WORKDIR")
+}
 
-# Podman's -i keeps the container's stdin open even after its attached client
-# exits. Supervise that client so closing an ACP client also stops the container.
-CID_DIR="$(mktemp -d)"
-CID_FILE="$CID_DIR/container-id"
-PODMAN_PID=
+run_codex_cli() {
+	local tty_args=()
 
-cleanup() {
+	if [[ -t 0 && -t 1 ]]; then
+		tty_args=(-it)
+	fi
+
+	exec podman run \
+		"${tty_args[@]}" \
+		"${COMMON_PODMAN_ARGS[@]}" \
+		codex-cli:latest \
+		codex \
+		--dangerously-bypass-approvals-and-sandbox \
+		"$@"
+}
+
+ACP_STATE_DIR=
+ACP_CONTAINER_ID_FILE=
+ACP_PODMAN_PID=
+
+stop_codex_acp_container() {
 	local container_id=
 
 	trap - EXIT HUP INT TERM
-	if [[ -n "$PODMAN_PID" ]]; then
-		kill "$PODMAN_PID" 2>/dev/null || true
+
+	if [[ -n "$ACP_PODMAN_PID" ]]; then
+		kill "$ACP_PODMAN_PID" 2>/dev/null || true
 	fi
-	if [[ -s "$CID_FILE" ]]; then
-		container_id="$(<"$CID_FILE")"
+	if [[ -s "$ACP_CONTAINER_ID_FILE" ]]; then
+		container_id="$(<"$ACP_CONTAINER_ID_FILE")"
 		podman stop --ignore --time 1 "$container_id" >/dev/null 2>&1 || true
 	fi
-	if [[ -n "$PODMAN_PID" ]]; then
-		wait "$PODMAN_PID" 2>/dev/null || true
+	if [[ -n "$ACP_PODMAN_PID" ]]; then
+		wait "$ACP_PODMAN_PID" 2>/dev/null || true
 	fi
-	rm -rf "$CID_DIR"
+	rm -rf "$ACP_STATE_DIR"
 }
 
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+run_codex_acp() {
+	local tty_args=(-i)
 
-exec 3<&0
-"${PODMAN_RUN[@]:0:2}" --cidfile "$CID_FILE" "${PODMAN_RUN[@]:2}" <&3 &
-PODMAN_PID=$!
-exec 3<&-
-wait "$PODMAN_PID"
+	if [[ -t 0 && -t 1 ]]; then
+		tty_args=(-it)
+	fi
+
+	# Podman keeps the ACP container alive after its stdio client disconnects.
+	# Supervise it so closing the client also stops the container.
+	ACP_STATE_DIR="$(mktemp -d)"
+	ACP_CONTAINER_ID_FILE="$ACP_STATE_DIR/container-id"
+
+	trap stop_codex_acp_container EXIT
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+
+	exec 3<&0
+	podman run \
+		"${tty_args[@]}" \
+		--cidfile "$ACP_CONTAINER_ID_FILE" \
+		"${COMMON_PODMAN_ARGS[@]}" \
+		codex-cli:latest \
+		codex-acp \
+		"$@" \
+		<&3 &
+	ACP_PODMAN_PID=$!
+	exec 3<&-
+
+	wait "$ACP_PODMAN_PID"
+}
+
+prepare_codex_home
+prepare_common_podman_args
+
+if [[ "$RUN_ACP" == true ]]; then
+	run_codex_acp "$@"
+else
+	run_codex_cli "$@"
+fi
