@@ -65,6 +65,8 @@ run_codex_cli() {
 
 ACP_STATE_DIR=
 ACP_CONTAINER_ID_FILE=
+ACP_RUNTIME_DIR=
+ACP_TMP_DIR=
 ACP_PODMAN_PID=
 
 stop_codex_acp_container() {
@@ -82,7 +84,9 @@ stop_codex_acp_container() {
 	if [[ -n "$ACP_PODMAN_PID" ]]; then
 		wait "$ACP_PODMAN_PID" 2>/dev/null || true
 	fi
-	rm -rf "$ACP_STATE_DIR"
+	if [[ -n "$ACP_STATE_DIR" ]]; then
+		rm -rf "$ACP_STATE_DIR"
+	fi
 }
 
 run_codex_acp() {
@@ -96,6 +100,10 @@ run_codex_acp() {
 	# Supervise it so closing the client also stops the container.
 	ACP_STATE_DIR="$(mktemp -d)"
 	ACP_CONTAINER_ID_FILE="$ACP_STATE_DIR/container-id"
+	ACP_RUNTIME_DIR="$ACP_STATE_DIR/runtime"
+	ACP_TMP_DIR="$ACP_STATE_DIR/tmp"
+	mkdir -p "$ACP_RUNTIME_DIR" "$ACP_TMP_DIR"
+	chmod 700 "$ACP_RUNTIME_DIR"
 
 	trap stop_codex_acp_container EXIT
 	trap 'exit 129' HUP
@@ -106,6 +114,10 @@ run_codex_acp() {
 	podman run \
 		"${tty_args[@]}" \
 		--cidfile "$ACP_CONTAINER_ID_FILE" \
+		--env XDG_RUNTIME_DIR=/tmp/codex-acp-runtime \
+		--env TMPDIR=/tmp/codex-acp-tmp \
+		-v "$ACP_RUNTIME_DIR:/tmp/codex-acp-runtime" \
+		-v "$ACP_TMP_DIR:/tmp/codex-acp-tmp" \
 		"${COMMON_PODMAN_ARGS[@]}" \
 		codex-cli:latest \
 		codex-acp \
