@@ -31,7 +31,7 @@ prepare_common_podman_args() {
 		--security-opt=no-new-privileges:true
 		--security-opt=label=disable
 		--env GIT_OPTIONAL_LOCKS=0
-		-v "$CODEX_HOME_HOST:/home/codex/.codex"
+		-v "$CODEX_HOME_HOST:/home/node/.codex"
 		-v "$WORKDIR:$WORKDIR"
 	)
 
@@ -116,6 +116,7 @@ run_codex_acp() {
 		--cidfile "$ACP_CONTAINER_ID_FILE" \
 		--env XDG_RUNTIME_DIR=/tmp/codex-acp-runtime \
 		--env TMPDIR=/tmp/codex-acp-tmp \
+		--env INITIAL_AGENT_MODE=agent-full-access \
 		-v "$ACP_RUNTIME_DIR:/tmp/codex-acp-runtime" \
 		-v "$ACP_TMP_DIR:/tmp/codex-acp-tmp" \
 		"${COMMON_PODMAN_ARGS[@]}" \
