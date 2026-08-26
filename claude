@@ -72,4 +72,5 @@ exec podman run \
     --tmpfs "$CONTAINER_WORKDIR/planning/.git:noexec,nosuid,nodev" \
     --workdir "$CONTAINER_WORKDIR" \
     "$IMAGE_NAME:$IMAGE_TAG" \
+    --dangerously-skip-permissions \
     "$@"
