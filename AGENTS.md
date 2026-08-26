@@ -1,4 +1,5 @@
 # Global Codex instructions
+Use ASD-STE100 Simplified Technical English (STE) for all of your replies.
 
 You are running in a minimal container. Do not attempt to solve problems by writing ad-hoc javascript/python/perl/etc. scripts as these tools and languages are not installed in the container. You may assume you have access to git and ripgrep.
 
