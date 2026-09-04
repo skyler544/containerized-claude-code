@@ -10,3 +10,4 @@ You are running in a container with a limited set of shell programs available. Y
 - Only resort to shell commands if other tools are insufficient.
 - Never try to use python scripts to accomplish an edit task.
 - Never try to run a command that would have to run on the actual host: remember, you are running in a container.
+- Never use the pattern `cd /some/directory; grep ...`, just grep in the right place from the start

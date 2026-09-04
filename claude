@@ -57,6 +57,104 @@ if [[ -d "$HOST_WORKDIR/.git" ]]; then
     GIT_MOUNT=(-v "$HOST_WORKDIR/.git:$CONTAINER_WORKDIR/.git:ro$Z")
 fi
 
+# ── Secret masking ────────────────────────────────────────────────────────────
+# The whole working directory is bind-mounted, so secret files inside it would
+# be readable in the container. A bind mount cannot exclude a sub-path, so each
+# secret is instead covered by a second mount:
+#   * a file      -> /dev/null, read-only, which reads as empty
+#   * a directory -> an empty tmpfs
+# The file still appears in listings, but its content never enters the
+# container. Masks are passed last so they overlay the parent mounts.
+#
+# No SELinux :z on these: /dev/null must not be relabeled, and a tmpfs needs no
+# label of ours.
+
+# Glob patterns of files to hide, matched against the base name only.
+SECRET_FILE_GLOBS=(
+    '.env' '.env.*'
+    '.netrc' '.npmrc' '.pgpass' '.htpasswd' '.dockercfg'
+    '*.pem' '*.key' '*.p12' '*.pfx' '*.jks' '*.keystore'
+    'id_rsa*' 'id_ecdsa*' 'id_ed25519*'
+    'credentials' 'credentials.json' 'service-account*.json'
+    'secrets.yml' 'secrets.yaml' 'secrets.json'
+)
+
+# Templates that hold no real values and stay visible.
+SECRET_FILE_KEEP=(
+    '.env.example' '.env.sample' '.env.dist' '.env.template'
+    '*.pem.example' '*.key.example'
+)
+
+# Directory names to replace with an empty tmpfs.
+SECRET_DIR_GLOBS=(
+    '.ssh' '.gnupg' '.aws' '.kube' '.docker' '.gcloud'
+    'secrets' 'secret'
+)
+
+# Directories that are never searched: large, or mounted separately.
+SECRET_SKIP_DIRS=(
+    '.git' 'node_modules' 'vendor' 'dist' 'build' '.cache'
+)
+
+SECRET_MASKS=()
+
+# mask_tree <host root> <container root>
+# Finds secrets under the host root and appends the matching mounts.
+mask_tree() {
+    local host_root="$1" container_root="$2"
+    [[ -d "$host_root" ]] || return 0
+
+    local -a find_args=("$host_root" -maxdepth 6)
+
+    # Prune the skip list first so it also applies to the directory matches.
+    local first=1 d
+    find_args+=(\()
+    for d in "${SECRET_SKIP_DIRS[@]}"; do
+        [[ $first == 1 ]] || find_args+=(-o)
+        find_args+=(-name "$d")
+        first=0
+    done
+    find_args+=(\) -prune -o)
+
+    # Secret directories: print and do not descend into them.
+    first=1
+    find_args+=(-type d \()
+    for d in "${SECRET_DIR_GLOBS[@]}"; do
+        [[ $first == 1 ]] || find_args+=(-o)
+        find_args+=(-name "$d")
+        first=0
+    done
+    find_args+=(\) -prune -print -o)
+
+    # Secret files, minus the templates that stay visible.
+    first=1
+    find_args+=(-type f \()
+    for d in "${SECRET_FILE_GLOBS[@]}"; do
+        [[ $first == 1 ]] || find_args+=(-o)
+        find_args+=(-name "$d")
+        first=0
+    done
+    find_args+=(\))
+    for d in "${SECRET_FILE_KEEP[@]}"; do
+        find_args+=(! -name "$d")
+    done
+    find_args+=(-print)
+
+    local path rel
+    while IFS= read -r path; do
+        rel="${path#"$host_root"/}"
+        if [[ -d "$path" ]]; then
+            SECRET_MASKS+=(--tmpfs "$container_root/$rel:noexec,nosuid,nodev")
+        else
+            SECRET_MASKS+=(-v "/dev/null:$container_root/$rel:ro")
+        fi
+        [[ -n "${CLAUDE_MASK_VERBOSE:-}" ]] && echo "claude: hiding $rel" >&2
+    done < <(find "${find_args[@]}" 2>/dev/null)
+}
+
+mask_tree "$HOST_WORKDIR" "$CONTAINER_WORKDIR"
+mask_tree "$HOME/planning" "$CONTAINER_WORKDIR/planning"
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 exec podman run \
     "${TTY_FLAGS[@]}" \
@@ -70,6 +168,7 @@ exec podman run \
     "${GIT_MOUNT[@]}" \
     -v "$HOME/planning:$CONTAINER_WORKDIR/planning$Z" \
     --tmpfs "$CONTAINER_WORKDIR/planning/.git:noexec,nosuid,nodev" \
+    "${SECRET_MASKS[@]}" \
     --workdir "$CONTAINER_WORKDIR" \
     "$IMAGE_NAME:$IMAGE_TAG" \
     --dangerously-skip-permissions \
