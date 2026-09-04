@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# Wrapper that runs Claude CLI inside a Docker container.
+# Wrapper that runs Claude Code inside a podman container.
 # Drop this in ~/.local/bin/claude (or any directory on your PATH) and chmod +x it.
 #
 # Usage: claude [any claude-code args]
-#   e.g. claude
-#        claude --help
-#        claude "explain this codebase"
 
 set -euo pipefail
 
@@ -13,62 +10,51 @@ IMAGE_NAME="claude-cli"
 IMAGE_TAG="latest"
 
 # ── Auth state ───────────────────────────────────────────────────────────────
-# Claude home dir is bind-mounted for session config, but credentials are kept
-# in a separate read-only location and injected via a dedicated bind mount so
-# that they are never writable from inside the container.
-#
-# Layout expected on the host:
 #   ~/.cache/claude-home/        – mutable session state (settings, history …)
-#   ~/.cache/claude-credentials/ – read-only auth tokens (.claude/credentials.json)
+#   ~/.cache/claude-credentials/ – auth tokens, mounted read-only
 #
-# First-time setup: run  mkdir -p ~/.cache/claude-credentials/.claude
-# then copy (or move) ~/.cache/claude-home/.claude/credentials.json there.
+# First-time setup: mkdir -p ~/.cache/claude-credentials/.claude
+# then move ~/.cache/claude-home/.claude/credentials.json there.
 CLAUDE_HOME="$HOME/.cache/claude-home"
 CLAUDE_CREDS_DIR="$HOME/.cache/claude-credentials"
 
 # ── Workspace ─────────────────────────────────────────────────────────────────
-# Mount the current working directory into the container as ~/workspace/<dirname>
 HOST_WORKDIR="$PWD"
 PROJECT_NAME="$(basename "$PWD")"
 CONTAINER_WORKDIR="/home/claude/workspace/$PROJECT_NAME"
 
 # ── SELinux ───────────────────────────────────────────────────────────────────
-# :Z relabeling requires the SELinux kernel module to be loaded. When SELinux is
-# fully disabled (not just permissive), lsetxattr fails with EPERM.
+# :z relabeling needs the SELinux module loaded; with SELinux off it fails with
+# EPERM, so only ask for it when it is enforcing.
 Z=""
 if [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
     Z=",z"
 fi
 
 # ── TTY detection ─────────────────────────────────────────────────────────────
-# Pass -it only when stdin is a real terminal (interactive session).
-# Without this, piping into claude (e.g. echo "..." | claude) would break.
+# -it only for a real terminal, so that  echo … | claude  keeps working.
 TTY_FLAGS=()
 if [[ -t 0 ]]; then
     TTY_FLAGS=(-it)
 fi
 
-# ── Mounts that exist only in the container ───────────────────────────────────
-# Paths that the container gets as a mount but that git in the workspace must
-# not report. They are added to the exclude list of the git snapshot below.
+# Paths that exist in the container as a mount only. They are excluded from git
+# in the snapshot below.
 MOUNT_ONLY_RELPATHS=(
     'planning'
 )
 
 # ── Secret masking ────────────────────────────────────────────────────────────
-# The whole working directory is bind-mounted, so secret files inside it would
-# be readable in the container. A bind mount cannot exclude a sub-path, so each
-# secret is instead covered by a second mount:
-#   * a .json file -> a read-only stub that holds "{}", so a parser still works
-#   * any other file -> /dev/null, read-only, which reads as empty
-#   * a directory  -> an empty read-only tmpfs
-# The name still appears in listings, but the content never enters the
-# container. Masks are passed last so they overlay the parent mounts.
-#
-# No SELinux :z on these: /dev/null must not be relabeled, and a tmpfs needs no
-# label of ours. The stub sits in the Claude home dir, which is already mounted.
+# A bind mount cannot exclude a sub-path, so every secret under the mounted
+# working directory is covered by a second mount:
+#   * a .json file    -> a read-only stub holding "{}", so a parser still works
+#   * any other file  -> /dev/null, read-only
+#   * a directory     -> an empty read-only tmpfs
+# The name stays visible, the content does not. Masks are passed to podman last
+# so they overlay the parent mounts. No :z on them: /dev/null must not be
+# relabeled and a tmpfs needs no label.
 
-# Glob patterns of files to hide, matched against the base name only.
+# Hidden by base name.
 SECRET_FILE_GLOBS=(
     '.env' '.env.*'
     '.netrc' '.npmrc' '.pgpass' '.htpasswd' '.dockercfg'
@@ -78,10 +64,9 @@ SECRET_FILE_GLOBS=(
     'secrets.yml' 'secrets.yaml' 'secrets.json'
 )
 
-# Patterns matched against the path below the mount root, for names that are
-# only sensitive in a certain place. A project-local Claude settings file can
-# grant permissions and register hooks, so the container must not read it: the
-# container gets its rules from the mounted Claude home dir instead.
+# Hidden by path, for names that are only sensitive in a certain place. A
+# project-local Claude settings file can grant permissions and register hooks,
+# so the container takes its rules from the mounted Claude home dir instead.
 SECRET_PATH_GLOBS=(
     '.claude/settings*.json'
 )
@@ -92,19 +77,17 @@ SECRET_FILE_KEEP=(
     '*.pem.example' '*.key.example'
 )
 
-# Directory names to replace with an empty tmpfs.
 SECRET_DIR_GLOBS=(
     '.ssh' '.gnupg' '.aws' '.kube' '.docker' '.gcloud'
     'secrets' 'secret'
 )
 
-# Directories that are never searched: large, or mounted separately.
+# Never searched: large, or mounted separately.
 SECRET_SKIP_DIRS=(
     '.git' 'node_modules' 'vendor' 'dist' 'build' '.cache'
 )
 
-# Stub for masked JSON files. An empty file makes some readers report a parse
-# error, so an empty object is used instead.
+# An empty file makes some readers report a parse error, so the stub holds {}.
 MASK_STUB_JSON="$CLAUDE_HOME/.mask/empty.json"
 mkdir -p "$(dirname "$MASK_STUB_JSON")"
 rm -f "$MASK_STUB_JSON"
@@ -113,12 +96,10 @@ chmod 444 "$MASK_STUB_JSON"
 
 SECRET_MASKS=()
 
-# Every masked path, relative to the workspace root. The git snapshot below
-# uses this list, so a path must never be masked without being recorded here.
+# Masked paths relative to the workspace root, for the git snapshot below.
 MASK_RELPATHS=()
 
 # mask_tree <host root> <container root> <prefix below the workspace root>
-# Finds secrets under the host root and appends the matching mounts.
 mask_tree() {
     local host_root="$1" container_root="$2" prefix="${3:-}"
     [[ -d "$host_root" ]] || return 0
@@ -135,7 +116,7 @@ mask_tree() {
     done
     find_args+=(\) -prune -o)
 
-    # Secret directories: print and do not descend into them.
+    # Secret directories, without descending into them.
     first=1
     find_args+=(-type d \()
     for d in "${SECRET_DIR_GLOBS[@]}"; do
@@ -145,7 +126,7 @@ mask_tree() {
     done
     find_args+=(\) -prune -print -o)
 
-    # Secret files by base name, minus the templates that stay visible.
+    # Secret files by base name, minus the templates.
     first=1
     find_args+=(-type f \()
     for d in "${SECRET_FILE_GLOBS[@]}"; do
@@ -159,7 +140,7 @@ mask_tree() {
     done
     find_args+=(-print -o)
 
-    # Secret files by path. Each pattern is tried at the root and below it.
+    # Secret files by path, tried at the root and below it.
     first=1
     find_args+=(-type f \()
     for d in "${SECRET_PATH_GLOBS[@]}"; do
@@ -173,9 +154,6 @@ mask_tree() {
     while IFS= read -r path; do
         rel="${path#"$host_root"/}"
         if [[ -d "$path" ]]; then
-            # ro as well: a writable mask lets an edit inside the container
-            # disappear without a trace, which the skip-worktree bit set below
-            # would then also keep out of git status.
             SECRET_MASKS+=(--tmpfs "$container_root/$rel:ro,noexec,nosuid,nodev")
         else
             [[ "$path" == *.json ]] && stub="$MASK_STUB_JSON" || stub="/dev/null"
@@ -188,7 +166,8 @@ mask_tree() {
 mask_tree "$HOST_WORKDIR" "$CONTAINER_WORKDIR" ""
 mask_tree "$HOME/planning" "$CONTAINER_WORKDIR/planning" "planning"
 
-# Every mask must be read-only before a single skip-worktree bit is set below.
+# A writable mask would swallow an edit made in the container, and the
+# skip-worktree bits below would keep it out of git status as well.
 for spec in "${SECRET_MASKS[@]}"; do
     case "$spec" in
         -v|--tmpfs|*:ro|*:ro,*) ;;
@@ -196,23 +175,12 @@ for spec in "${SECRET_MASKS[@]}"; do
     esac
 done
 
-# ── Git snapshot for the container ────────────────────────────────────────────
-# The container gets a private, read-only copy of the git dir instead of the
-# live one. git log/diff/status keep working, git add/commit/push still fail on
-# the read-only mount, and the copy carries two pieces of extra state so that
-# the mounts of this wrapper produce no phantom changes:
-#
-#   * skip-worktree on every tracked path that a mask covers, so the masked
-#     (empty) content does not read as a modification or a deletion. This is
-#     safe only because each such path is a read-only mount, asserted above:
-#     no real edit can be made to it, so none can be swallowed.
-#   * an exclude entry for every masked path that git does not track and for
-#     each mount-only path, so nothing shows up as untracked.
-#
-# The copy lives inside the host .git dir. That keeps it on the same filesystem,
-# so cp -al hardlinks instead of duplicating the object store, and keeps it out
-# of the workspace listing. It is a snapshot: a commit or a branch switch on the
-# host during a session is not picked up until the next start.
+# ── Git snapshot ──────────────────────────────────────────────────────────────
+# The container gets a private read-only copy of the git dir, so git log/diff/
+# status work while add/commit/push fail. The copy is what makes the mounts of
+# this wrapper invisible to git: skip-worktree on every tracked path a mask
+# covers, and an exclude entry for the rest. It lives inside the host .git dir,
+# which keeps cp -al on one filesystem and out of the workspace listing.
 GIT_MOUNT=()
 
 prepare_git_snapshot() {
@@ -221,10 +189,8 @@ prepare_git_snapshot() {
 
     local snap="$gitdir/claude-snapshot.$$"
 
-    # No trap can clean up after the exec below. The name carries the PID of
-    # this wrapper, and exec keeps that PID for the container, so a snapshot
-    # whose PID is gone belongs to a finished session. Age is the fallback for
-    # the case where the number was handed out again in the meantime.
+    # No trap can run after the exec below. exec keeps this PID for the
+    # container, so a snapshot with a dead PID is from a finished session.
     local old pid
     for old in "$gitdir"/claude-snapshot.*; do
         [[ -d "$old" ]] || continue
@@ -245,9 +211,8 @@ prepare_git_snapshot() {
         cp -al "$entry" "$snap/" 2>/dev/null || cp -a "$entry" "$snap/"
     done
 
-    # cp -al hardlinks, so the copy and the host file are the same inode: a
-    # write through the copy would reach the host repository. Break the link on
-    # every file this wrapper writes to.
+    # Break the hardlinks on the files written below, or the writes land in the
+    # host repository.
     local -a git_cmd=(git --git-dir="$snap" --work-tree="$HOST_WORKDIR")
     mkdir -p "$snap/info"
     local f
@@ -257,17 +222,12 @@ prepare_git_snapshot() {
     done
     printf '\n# claude wrapper: masked and mount-only paths\n' >> "$snap/info/exclude"
 
-    # The NUL-separated list goes through a file, not a variable: command
-    # substitution drops NUL bytes and would join the paths into one.
-    # A mask hides the file in the worktree, not the commits behind it: where a
-    # masked path is tracked, the container still reads the committed content
-    # with git show. Only an untracked path is fully hidden.
+    # The list goes through a file because command substitution drops the NUL
+    # separators. A path ls-files does not return is not in the index, where
+    # update-index would fail, so it becomes an exclude entry.
     local rel list
     list="$(mktemp)"
     for rel in "${MASK_RELPATHS[@]}"; do
-        # -z keeps a path with a space or a newline in it intact. A path that
-        # ls-files does not return is not in the index, and update-index would
-        # fail on it, so it becomes an exclude entry instead.
         "${git_cmd[@]}" ls-files -z -- "$rel" > "$list" 2>/dev/null || true
         if [[ -s "$list" ]]; then
             xargs -0 -r "${git_cmd[@]}" update-index --skip-worktree -- < "$list"
