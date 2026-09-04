@@ -57,12 +57,6 @@ if [[ -t 0 ]]; then
     TTY_FLAGS=(-it)
 fi
 
-# Paths that exist in the container as a mount only. They are excluded from git
-# in the snapshot below.
-MOUNT_ONLY_RELPATHS=(
-    'planning'
-)
-
 # ── Secret masking ────────────────────────────────────────────────────────────
 # A bind mount cannot exclude a sub-path, so every secret under the mounted
 # working directory is covered by a second mount:
@@ -106,6 +100,11 @@ SECRET_SKIP_DIRS=(
     '.git' 'node_modules' 'vendor' 'dist' 'build' '.cache'
 )
 
+# Bounds the startup scan. A secret nested deeper than this is not masked.
+MASK_SEARCH_DEPTH=6
+
+EMPTY_FILE="/dev/null"
+
 # An empty file makes some readers report a parse error, so the stub holds {}.
 MASK_STUB_JSON="$CLAUDE_HOME/.mask/empty.json"
 mkdir -p "$(dirname "$MASK_STUB_JSON")"
@@ -113,159 +112,190 @@ rm -f "$MASK_STUB_JSON"
 printf "{}\\n" > "$MASK_STUB_JSON"
 chmod 444 "$MASK_STUB_JSON"
 
+# Masks, and the same paths relative to the workspace root for the git snapshot.
 SECRET_MASKS=()
-
-# Masked paths relative to the workspace root, for the git snapshot below.
 MASK_RELPATHS=()
 
-# mask_tree <host root> <container root> <prefix below the workspace root>
+# mask_file <container path>
+mask_file() {
+    local stub="$EMPTY_FILE"
+    [[ "$1" == *.json ]] && stub="$MASK_STUB_JSON"
+    SECRET_MASKS+=(-v "$stub:$1:ro")
+}
+
+# mask_dir <container path>
+mask_dir() {
+    SECRET_MASKS+=(--tmpfs "$1:$EMPTY_DIR_OPTS")
+}
+
+# append_glob_group <array name> <find predicate> <glob …>  ->  ( -name a -o -name b )
+append_glob_group() {
+    local -n group_out="$1"
+    local predicate="$2"
+    shift 2
+    local first=1 glob
+    group_out+=('(')
+    for glob in "$@"; do
+        (( first )) || group_out+=(-o)
+        group_out+=("$predicate" "$glob")
+        first=0
+    done
+    group_out+=(')')
+}
+
+# mask_tree <host root> <container root>
 mask_tree() {
-    local host_root="$1" container_root="$2" prefix="${3:-}"
+    local host_root="$1" container_root="$2"
     [[ -d "$host_root" ]] || return 0
 
-    local -a find_args=("$host_root" -maxdepth 6)
+    local prefix="${container_root#"$CONTAINER_WORKDIR"}"
+    prefix="${prefix#/}"
 
-    # Prune the skip list first so it also applies to the directory matches.
-    local first=1 d
-    find_args+=(\()
-    for d in "${SECRET_SKIP_DIRS[@]}"; do
-        [[ $first == 1 ]] || find_args+=(-o)
-        find_args+=(-name "$d")
-        first=0
-    done
-    find_args+=(\) -prune -o)
+    local -a find_args=("$host_root" -maxdepth "$MASK_SEARCH_DEPTH")
 
-    # Secret directories, without descending into them.
-    first=1
-    find_args+=(-type d \()
-    for d in "${SECRET_DIR_GLOBS[@]}"; do
-        [[ $first == 1 ]] || find_args+=(-o)
-        find_args+=(-name "$d")
-        first=0
-    done
-    find_args+=(\) -prune -print -o)
+    # Pruned first, so the skip list also covers the directory matches.
+    append_glob_group find_args -name "${SECRET_SKIP_DIRS[@]}"
+    find_args+=(-prune -o)
 
-    # Secret files by base name, minus the templates.
-    first=1
-    find_args+=(-type f \()
-    for d in "${SECRET_FILE_GLOBS[@]}"; do
-        [[ $first == 1 ]] || find_args+=(-o)
-        find_args+=(-name "$d")
-        first=0
-    done
-    find_args+=(\))
-    for d in "${SECRET_FILE_KEEP[@]}"; do
-        find_args+=(! -name "$d")
+    find_args+=(-type d)
+    append_glob_group find_args -name "${SECRET_DIR_GLOBS[@]}"
+    find_args+=(-prune -print -o)
+
+    find_args+=(-type f)
+    append_glob_group find_args -name "${SECRET_FILE_GLOBS[@]}"
+    local keep
+    for keep in "${SECRET_FILE_KEEP[@]}"; do
+        find_args+=(! -name "$keep")
     done
     find_args+=(-print -o)
 
-    # Secret files by path, tried at the root and below it.
-    first=1
-    find_args+=(-type f \()
-    for d in "${SECRET_PATH_GLOBS[@]}"; do
-        [[ $first == 1 ]] || find_args+=(-o)
-        find_args+=(-path "$host_root/$d" -o -path "$host_root/*/$d")
-        first=0
+    # Each path glob applies at the root and anywhere below it.
+    local -a path_globs=() glob
+    for glob in "${SECRET_PATH_GLOBS[@]}"; do
+        path_globs+=("$host_root/$glob" "$host_root/*/$glob")
     done
-    find_args+=(\) -print)
+    find_args+=(-type f)
+    append_glob_group find_args -path "${path_globs[@]}"
+    find_args+=(-print)
 
-    local path rel stub
+    local path rel
     while IFS= read -r path; do
         rel="${path#"$host_root"/}"
         if [[ -d "$path" ]]; then
-            SECRET_MASKS+=(--tmpfs "$container_root/$rel:$EMPTY_DIR_OPTS")
+            mask_dir "$container_root/$rel"
         else
-            [[ "$path" == *.json ]] && stub="$MASK_STUB_JSON" || stub="/dev/null"
-            SECRET_MASKS+=(-v "$stub:$container_root/$rel:ro")
+            mask_file "$container_root/$rel"
         fi
         MASK_RELPATHS+=("${prefix:+$prefix/}$rel")
     done < <(find "${find_args[@]}" 2>/dev/null)
 }
 
-mask_tree "$HOST_WORKDIR" "$CONTAINER_WORKDIR" ""
-mask_tree "$HOME/planning" "$CONTAINER_WORKDIR/planning" "planning"
-
-# A writable mask would swallow an edit made in the container, and the
-# skip-worktree bits below would keep it out of git status as well.
-for spec in "${SECRET_MASKS[@]}"; do
-    case "$spec" in
-        -v|--tmpfs|*:ro|*:ro,*) ;;
-        *) echo "claude: mask is not read-only, refusing to start: $spec" >&2; exit 1 ;;
-    esac
-done
-
 # ── Git snapshot ──────────────────────────────────────────────────────────────
 # The container gets a private read-only copy of the git dir, so git log/diff/
-# status work while add/commit/push fail. The copy is what makes the mounts of
-# this wrapper invisible to git: skip-worktree on every tracked path a mask
-# covers, and an exclude entry for the rest. It lives inside the host .git dir,
-# which keeps cp -al on one filesystem and out of the workspace listing.
-add_git_snapshot_mount() {
-    local gitdir="$HOST_WORKDIR/.git"
-    [[ -d "$gitdir" ]] || return 0
+# status work while add/commit/push fail. The copy is also what makes the mounts
+# of this wrapper invisible to git. It lives inside the host .git dir, which
+# keeps cp -al on one filesystem and out of the workspace listing.
+SESSION_SNAPSHOT_PREFIX="claude-session"
 
-    local snap="$gitdir/claude-snapshot.$$"
+# Workspace-relative paths that git must not report at all.
+GIT_EXCLUDE_RELPATHS=()
 
-    # No trap can run after the exec below. exec keeps this PID for the
-    # container, so a snapshot with a dead PID is from a finished session.
-    local old pid
-    for old in "$gitdir"/claude-snapshot.*; do
-        [[ -d "$old" ]] || continue
-        pid="${old##*.}"
+# remove_finished_session_snapshots <git dir>
+# No trap can run after the exec below, and exec hands this PID to the
+# container, so a snapshot named after a PID that is gone is from a finished
+# session. Age covers a PID that has since been handed out again.
+remove_finished_session_snapshots() {
+    local gitdir="$1" snapshot pid
+    for snapshot in "$gitdir/$SESSION_SNAPSHOT_PREFIX".*; do
+        [[ -d "$snapshot" ]] || continue
+        pid="${snapshot##*.}"
         if [[ "$pid" == "$$" ]] || ! kill -0 "$pid" 2>/dev/null; then
-            rm -rf "$old"
+            rm -rf "$snapshot"
         fi
     done
-    find "$gitdir" -maxdepth 1 -name 'claude-snapshot.*' -mtime +0 \
+    find "$gitdir" -maxdepth 1 -name "$SESSION_SNAPSHOT_PREFIX.*" -mtime +0 \
         -exec rm -rf {} + 2>/dev/null || true
-    mkdir -p "$snap"
+}
 
-    local entry name
+# copy_git_dir <git dir> <destination>
+copy_git_dir() {
+    local gitdir="$1" dest="$2" entry name written
+    mkdir -p "$dest"
     for entry in "$gitdir"/* "$gitdir"/.[!.]*; do
         [[ -e "$entry" ]] || continue
         name="${entry##*/}"
-        [[ "$name" == claude-snapshot.* ]] && continue
-        cp -al "$entry" "$snap/" 2>/dev/null || cp -a "$entry" "$snap/"
+        [[ "$name" == "$SESSION_SNAPSHOT_PREFIX".* ]] && continue
+        cp -al "$entry" "$dest/" 2>/dev/null || cp -a "$entry" "$dest/"
     done
 
-    # Break the hardlinks on the files written below, or the writes land in the
-    # host repository.
-    local -a git_cmd=(git --git-dir="$snap" --work-tree="$HOST_WORKDIR")
-    mkdir -p "$snap/info"
-    local f
-    for f in "$snap/index" "$snap/info/exclude"; do
-        [[ -f "$f" ]] || continue
-        cp "$f" "$f.claude" && mv -f "$f.claude" "$f"
+    # The copy shares inodes with the host repository, so break the link on
+    # every file written afterwards.
+    mkdir -p "$dest/info"
+    for written in "$dest/index" "$dest/info/exclude"; do
+        [[ -f "$written" ]] || continue
+        cp "$written" "$written.claude" && mv -f "$written.claude" "$written"
     done
-    printf '\n# claude wrapper: masked and mount-only paths\n' >> "$snap/info/exclude"
+}
 
-    # The list goes through a file because command substitution drops the NUL
-    # separators. A path ls-files does not return is not in the index, where
-    # update-index would fail, so it becomes an exclude entry.
+# hide_wrapper_mounts_from_git <git dir copy>
+# skip-worktree keeps a masked tracked path from reading as a modification or a
+# deletion; anything git does not track becomes an exclude entry.
+hide_wrapper_mounts_from_git() {
+    local snapshot="$1"
+    local -a git_cmd=(git --git-dir="$snapshot" --work-tree="$HOST_WORKDIR")
     local rel list
+
+    printf '\n# claude wrapper: masked and mounted paths\n' >> "$snapshot/info/exclude"
+
+    # ls-files output goes through a file because command substitution drops
+    # the NUL separators. A path it does not return is not in the index, where
+    # update-index would fail.
     list="$(mktemp)"
     for rel in "${MASK_RELPATHS[@]}"; do
         "${git_cmd[@]}" ls-files -z -- "$rel" > "$list" 2>/dev/null || true
         if [[ -s "$list" ]]; then
             xargs -0 -r "${git_cmd[@]}" update-index --skip-worktree -- < "$list"
         else
-            printf '/%s\n' "$rel" >> "$snap/info/exclude"
+            printf '/%s\n' "$rel" >> "$snapshot/info/exclude"
         fi
     done
     rm -f "$list"
 
-    for rel in "${MOUNT_ONLY_RELPATHS[@]}"; do
-        printf '/%s\n' "$rel" >> "$snap/info/exclude"
+    for rel in "${GIT_EXCLUDE_RELPATHS[@]}"; do
+        printf '/%s\n' "$rel" >> "$snapshot/info/exclude"
     done
+}
 
-    add_bind_mount "$snap" "$CONTAINER_WORKDIR/.git" ro
+add_git_snapshot_mount() {
+    local gitdir="$HOST_WORKDIR/.git"
+    [[ -d "$gitdir" ]] || return 0
+
+    local snapshot="$gitdir/$SESSION_SNAPSHOT_PREFIX.$$"
+    remove_finished_session_snapshots "$gitdir"
+    copy_git_dir "$gitdir" "$snapshot"
+    hide_wrapper_mounts_from_git "$snapshot"
+    add_bind_mount "$snapshot" "$CONTAINER_WORKDIR/.git" ro
+}
+
+# planning_directory <host path> <name in the workspace>
+# A host directory mounted into the workspace: writable, masked like the
+# workspace itself, no repository of its own, and never reported by the
+# workspace's git.
+planning_directory() {
+    local host_path="$1" name="$2"
+    local container_path="$CONTAINER_WORKDIR/$name"
+
+    add_bind_mount "$host_path" "$container_path"
+    add_empty_dir "$container_path/.git"
+    mask_tree "$host_path" "$container_path"
+    GIT_EXCLUDE_RELPATHS+=("$name")
 }
 
 add_bind_mount "$CLAUDE_HOME" /home/claude
 add_bind_mount "$HOST_WORKDIR" "$CONTAINER_WORKDIR"
+mask_tree "$HOST_WORKDIR" "$CONTAINER_WORKDIR"
+planning_directory "$HOME/planning" planning
 add_git_snapshot_mount
-add_bind_mount "$HOME/planning" "$CONTAINER_WORKDIR/planning"
-add_empty_dir "$CONTAINER_WORKDIR/planning/.git"
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 # Masks come last so they overlay the mounts above. --network=bridge keeps the

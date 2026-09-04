@@ -9,6 +9,10 @@ The project consists of a `Dockerfile` and a `claude` wrapper script. The wrappe
 - If needed, mark the script as executable: `chmod +x $REPO_LOCATION/claude`
 
 ### Usage
+Run `./test-claude-wrapper` after changing the wrapper: it states the behavior
+below as assertions and checks them against a fake podman, so no container
+starts.
+
 Run `claude` from any directory you want to work in. The oauth flow should happen automatically on first run, but you may need to manually copy/paste the auth link and token.
 
 ### Secret masking

@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# The requirements of the claude wrapper, as assertions.
+#
+# The wrapper is run against a fake podman that records its arguments, so no
+# container is started and nothing on the host is touched outside a temp dir.
+#
+# Usage: ./test-claude-wrapper
+
+set -uo pipefail
+
+WRAPPER="$(dirname "$(readlink -f "$0")")/claude"
+TMP="$(mktemp -d)"
+ARGS="$TMP/podman-args"
+OUTPUT="$TMP/wrapper-output"
+REPO="$TMP/repo"
+FAILURES=0
+
+trap 'rm -rf "$TMP"' EXIT
+
+requirement() { printf '\n%s\n' "$1"; }
+
+check() { # check <description> <command …>
+    local description="$1"
+    shift
+    if "$@" >/dev/null 2>&1; then
+        printf '  ok    %s\n' "$description"
+    else
+        printf '  FAIL  %s\n' "$description"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+skip() { printf '  skip  %s (%s)\n' "$1" "$2"; }
+
+has_arg()      { grep -qxF -- "$1" "$ARGS"; }
+has_spec()     { grep -qE -- "$1" "$ARGS"; }
+lacks_spec()   { ! grep -qE -- "$1" "$ARGS"; }
+line_of()      { grep -nE -- "$1" "$ARGS" | head -1 | cut -d: -f1; }
+
+container_git() { git --git-dir="$SNAPSHOT" --work-tree="$REPO" "$@"; }
+write_fails()   { ! container_git add newfile.txt; }
+status_hides()  { ! container_git status --short | grep -qE -- "$1"; }
+status_shows()  { container_git status --short | grep -qE -- "$1"; }
+
+# ── Fixture ───────────────────────────────────────────────────────────────────
+# A repository holding every case the wrapper has to tell apart.
+build_fixture() {
+    rm -rf "$TMP/bin" "$TMP/home" "$REPO" "$TMP/plain"
+    mkdir -p "$TMP/bin" "$TMP/home/planning" "$REPO" "$TMP/plain"
+
+    cat > "$TMP/bin/podman" <<'FAKE_PODMAN'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$PODMAN_ARGS"
+FAKE_PODMAN
+    chmod +x "$TMP/bin/podman"
+
+    mkdir -p "$TMP/selinux-bin"
+    printf '#!/bin/sh\necho Enforcing\n' > "$TMP/selinux-bin/getenforce"
+    chmod +x "$TMP/selinux-bin/getenforce"
+
+    printf 'note\n' > "$TMP/home/planning/notes.md"
+    git -C "$TMP/home/planning" init -q .
+
+    git -C "$REPO" init -q .
+    git -C "$REPO" config user.email test@example.com
+    git -C "$REPO" config user.name test
+    mkdir -p "$REPO/secrets" "$REPO/.claude" "$REPO/node_modules" \
+             "$REPO/deep/1/2/3/4/5"
+    printf 'code\n'        > "$REPO/main.txt"
+    printf 'token\n'       > "$REPO/.npmrc"
+    printf 'x\n'           > "$REPO/secrets/a.txt"
+    printf 'y\n'           > "$REPO/secrets/b.txt"
+    printf '{"p":1}\n'     > "$REPO/.claude/settings.json"
+    git -C "$REPO" add -A
+    git -C "$REPO" commit -qm init
+
+    printf 'SECRET=1\n'    > "$REPO/.env"
+    printf 'EXAMPLE=1\n'   > "$REPO/.env.example"
+    printf 'SECRET=1\n'    > "$REPO/node_modules/.env"
+    printf 'SECRET=1\n'    > "$REPO/deep/1/2/3/4/.env"
+    printf 'SECRET=1\n'    > "$REPO/deep/1/2/3/4/5/.env"
+    printf 'work\n'       >> "$REPO/main.txt"
+    printf 'new\n'         > "$REPO/newfile.txt"
+}
+
+run_wrapper() { # run_wrapper <working directory> [extra PATH entry]
+    local workdir="$1" extra_path="${2:-}"
+    ( cd "$workdir" \
+      && HOME="$TMP/home" \
+         PATH="${extra_path:+$extra_path:}$TMP/bin:$PATH" \
+         PODMAN_ARGS="$ARGS" \
+         bash "$WRAPPER" "explain this codebase" ) > "$OUTPUT" 2>&1 < /dev/null
+}
+
+# Same, with a pty on stdin. Needs script(1); the caller skips without it.
+run_wrapper_on_a_terminal() {
+    script -qec "cd '$REPO' \
+        && HOME='$TMP/home' PATH='$TMP/bin:$PATH' PODMAN_ARGS='$ARGS' \
+           bash '$WRAPPER' interactive" /dev/null > "$OUTPUT" 2>&1
+}
+
+build_fixture
+run_wrapper "$REPO"
+SNAPSHOT="$(ls -d "$REPO/.git/claude-session."* 2>/dev/null | head -1)"
+
+requirement "Invocation"
+check "passes the user's arguments through"        has_arg "explain this codebase"
+check "always skips the permission prompts"        has_arg "--dangerously-skip-permissions"
+check "runs the pinned image"                      has_arg "claude-cli:latest"
+check "removes the container on exit"              has_arg "--rm"
+check "no -it when stdin is not a terminal"        lacks_spec '^-it$'
+check "prints nothing"                             test ! -s "$OUTPUT"
+
+if command -v script >/dev/null 2>&1; then
+    run_wrapper_on_a_terminal
+    check "-it when stdin is a terminal"           has_arg "-it"
+    run_wrapper "$REPO"
+else
+    skip "-it when stdin is a terminal"            "needs script(1) for a pty"
+fi
+
+requirement "Privileges and network"
+check "keeps the host uid"                         has_arg "--userns=keep-id"
+check "drops all capabilities"                     has_arg "--cap-drop=ALL"
+check "forbids new privileges"                     has_arg "--security-opt=no-new-privileges:true"
+check "stays off the host's LAN address"           has_arg "--network=bridge"
+
+requirement "Mounts"
+check "session state at /home/claude"              has_spec ":/home/claude$"
+check "working directory in the workspace"         has_spec ":/home/claude/workspace/repo$"
+check "starts in the workspace"                    has_arg "/home/claude/workspace/repo"
+check "no separate credentials mount"              lacks_spec 'credentials'
+check "planning dir mounted into the workspace"    has_spec ":/home/claude/workspace/repo/planning$"
+check "planning is no repository of its own"       has_spec '/planning/\.git:ro,noexec,nosuid,nodev$'
+
+requirement "Secret masking"
+check "secret file reads as empty"                 has_spec '^/dev/null:.*/repo/\.env:ro$'
+check "secret .json reads as {}"                   has_spec '^.*/\.mask/empty\.json:.*/settings\.json:ro$'
+check "secret directory reads as empty"            has_spec '/repo/secrets:ro,noexec,nosuid,nodev$'
+check "template stays visible"                     lacks_spec '\.env\.example'
+check "skipped directories are not scanned"        lacks_spec 'node_modules'
+check "masks within the search depth"              has_spec '/repo/deep/1/2/3/4/\.env:ro$'
+check "nothing deeper than the search depth"       lacks_spec '/repo/deep/1/2/3/4/5/\.env'
+check "masks overlay the mounts above them"        test "$(line_of '/repo/\.git:ro')" -lt "$(line_of '^/dev/null:')"
+
+requirement "Git"
+check "the container's .git is a session snapshot" has_spec 'claude-session\..*:/home/claude/workspace/repo/\.git:ro'
+check "reading history works"                      container_git log --oneline
+check "no masked path is reported"                 status_hides '\.env$|\.npmrc|secrets/|settings\.json'
+check "the planning mount is not reported"         status_hides 'planning'
+check "a real edit is still reported"              status_shows '^ M main\.txt$'
+check "a real new file is still reported"          status_shows '^\?\? newfile\.txt$'
+
+chmod -R a-w "$SNAPSHOT"
+check "committing fails on the read-only copy"     write_fails
+chmod -R u+w "$SNAPSHOT"
+
+HOST_INDEX="$(md5sum "$REPO/.git/index" | cut -d' ' -f1)"
+HOST_EXCLUDE="$(md5sum "$REPO/.git/info/exclude" | cut -d' ' -f1)"
+run_wrapper "$REPO"
+check "the host index is never written" \
+    test "$HOST_INDEX" = "$(md5sum "$REPO/.git/index" | cut -d' ' -f1)"
+check "the host exclude file is never written" \
+    test "$HOST_EXCLUDE" = "$(md5sum "$REPO/.git/info/exclude" | cut -d' ' -f1)"
+
+requirement "Parallel sessions in one code base"
+tail -f /dev/null & LIVE_SESSION=$!
+mkdir -p "$REPO/.git/claude-session.$LIVE_SESSION"
+run_wrapper "$REPO"
+check "a running session's snapshot is kept"       test -d "$REPO/.git/claude-session.$LIVE_SESSION"
+kill "$LIVE_SESSION" 2>/dev/null
+run_wrapper "$REPO"
+check "a finished session's snapshot is removed"   test ! -d "$REPO/.git/claude-session.$LIVE_SESSION"
+
+requirement "Directories that are not repositories"
+run_wrapper "$TMP/plain"; PLAIN_EXIT=$?
+check "start without a repository"                 test "$PLAIN_EXIT" -eq 0
+check "no .git mount without a repository"         lacks_spec ':/home/claude/workspace/plain/\.git:ro$'
+
+requirement "SELinux labels"
+run_wrapper "$REPO" "$TMP/selinux-bin"
+check "host paths get the shared label"            has_spec ':/home/claude:z$'
+check "the git snapshot keeps read-only plus it"   has_spec '/repo/\.git:ro,z$'
+check "masks are never relabeled"                  lacks_spec '^/dev/null:.*:ro,z$|:ro,noexec,nosuid,nodev,z$'
+run_wrapper "$REPO"
+check "no labels when SELinux is off"              lacks_spec ':z$|,z$'
+
+printf '\n'
+if (( FAILURES )); then
+    printf '%d failed\n' "$FAILURES"
+    exit 1
+fi
+printf 'all requirements hold\n'
