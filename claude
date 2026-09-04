@@ -61,13 +61,14 @@ fi
 # The whole working directory is bind-mounted, so secret files inside it would
 # be readable in the container. A bind mount cannot exclude a sub-path, so each
 # secret is instead covered by a second mount:
-#   * a file      -> /dev/null, read-only, which reads as empty
-#   * a directory -> an empty tmpfs
-# The file still appears in listings, but its content never enters the
+#   * a .json file -> a read-only stub that holds "{}", so a parser still works
+#   * any other file -> /dev/null, read-only, which reads as empty
+#   * a directory  -> an empty tmpfs
+# The name still appears in listings, but the content never enters the
 # container. Masks are passed last so they overlay the parent mounts.
 #
 # No SELinux :z on these: /dev/null must not be relabeled, and a tmpfs needs no
-# label of ours.
+# label of ours. The stub sits in the Claude home dir, which is already mounted.
 
 # Glob patterns of files to hide, matched against the base name only.
 SECRET_FILE_GLOBS=(
@@ -77,6 +78,14 @@ SECRET_FILE_GLOBS=(
     'id_rsa*' 'id_ecdsa*' 'id_ed25519*'
     'credentials' 'credentials.json' 'service-account*.json'
     'secrets.yml' 'secrets.yaml' 'secrets.json'
+)
+
+# Patterns matched against the path below the mount root, for names that are
+# only sensitive in a certain place. A project-local Claude settings file can
+# grant permissions and register hooks, so the container must not read it: the
+# container gets its rules from the mounted Claude home dir instead.
+SECRET_PATH_GLOBS=(
+    '.claude/settings*.json'
 )
 
 # Templates that hold no real values and stay visible.
@@ -95,6 +104,14 @@ SECRET_DIR_GLOBS=(
 SECRET_SKIP_DIRS=(
     '.git' 'node_modules' 'vendor' 'dist' 'build' '.cache'
 )
+
+# Stub for masked JSON files. An empty file makes some readers report a parse
+# error, so an empty object is used instead.
+MASK_STUB_JSON="$CLAUDE_HOME/.mask/empty.json"
+mkdir -p "$(dirname "$MASK_STUB_JSON")"
+rm -f "$MASK_STUB_JSON"
+printf "{}\\n" > "$MASK_STUB_JSON"
+chmod 444 "$MASK_STUB_JSON"
 
 SECRET_MASKS=()
 
@@ -126,7 +143,7 @@ mask_tree() {
     done
     find_args+=(\) -prune -print -o)
 
-    # Secret files, minus the templates that stay visible.
+    # Secret files by base name, minus the templates that stay visible.
     first=1
     find_args+=(-type f \()
     for d in "${SECRET_FILE_GLOBS[@]}"; do
@@ -138,17 +155,30 @@ mask_tree() {
     for d in "${SECRET_FILE_KEEP[@]}"; do
         find_args+=(! -name "$d")
     done
-    find_args+=(-print)
+    find_args+=(-print -o)
 
-    local path rel
+    # Secret files by path. Each pattern is tried at the root and below it.
+    first=1
+    find_args+=(-type f \()
+    for d in "${SECRET_PATH_GLOBS[@]}"; do
+        [[ $first == 1 ]] || find_args+=(-o)
+        find_args+=(-path "$host_root/$d" -o -path "$host_root/*/$d")
+        first=0
+    done
+    find_args+=(\) -print)
+
+    local path rel stub
     while IFS= read -r path; do
         rel="${path#"$host_root"/}"
         if [[ -d "$path" ]]; then
             SECRET_MASKS+=(--tmpfs "$container_root/$rel:noexec,nosuid,nodev")
         else
-            SECRET_MASKS+=(-v "/dev/null:$container_root/$rel:ro")
+            [[ "$path" == *.json ]] && stub="$MASK_STUB_JSON" || stub="/dev/null"
+            SECRET_MASKS+=(-v "$stub:$container_root/$rel:ro")
         fi
-        [[ -n "${CLAUDE_MASK_VERBOSE:-}" ]] && echo "claude: hiding $rel" >&2
+        if [[ -n "${CLAUDE_MASK_VERBOSE:-}" ]]; then
+            echo "claude: hiding $rel" >&2
+        fi
     done < <(find "${find_args[@]}" 2>/dev/null)
 }
 
