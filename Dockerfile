@@ -2,10 +2,16 @@ FROM alpine:latest
 
 # Install only the CLI tools you want Claude to have access to.
 RUN apk add --no-cache \
-    ca-certificates \
-    curl \
     bash \
-    git
+    ca-certificates \
+    coreutils \
+    curl \
+    diffutils \
+    findutils \
+    gawk \
+    git \
+    grep \
+    sed
 
 # must install as root, otherwise the bind mount of the claude home dir will overwrite the binary
 RUN curl -fsSL https://claude.ai/install.sh | bash \
