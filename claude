@@ -9,27 +9,46 @@ set -euo pipefail
 IMAGE_NAME="claude-cli"
 IMAGE_TAG="latest"
 
-# ── Auth state ───────────────────────────────────────────────────────────────
-#   ~/.cache/claude-home/        – mutable session state (settings, history …)
-#   ~/.cache/claude-credentials/ – auth tokens, mounted read-only
-#
-# First-time setup: mkdir -p ~/.cache/claude-credentials/.claude
-# then move ~/.cache/claude-home/.claude/credentials.json there.
+# Session state: settings, history, credentials.
 CLAUDE_HOME="$HOME/.cache/claude-home"
-CLAUDE_CREDS_DIR="$HOME/.cache/claude-credentials"
 
 # ── Workspace ─────────────────────────────────────────────────────────────────
 HOST_WORKDIR="$PWD"
 PROJECT_NAME="$(basename "$PWD")"
 CONTAINER_WORKDIR="/home/claude/workspace/$PROJECT_NAME"
 
-# ── SELinux ───────────────────────────────────────────────────────────────────
-# :z relabeling needs the SELinux module loaded; with SELinux off it fails with
-# EPERM, so only ask for it when it is enforcing.
-Z=""
+# ── Host path mounts ──────────────────────────────────────────────────────────
+# Relabeling needs the SELinux module loaded; with SELinux off it fails with
+# EPERM. The shared label 'z' is required, not the private 'Z': a private label
+# would stop a second container from mounting the same host directory, so two
+# agents could not work in one code base at the same time.
+SHARED_LABEL_OPTS=()
 if [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
-    Z=",z"
+    SHARED_LABEL_OPTS=(z)
 fi
+
+# Ordered podman mount arguments. Later entries overlay earlier ones.
+MOUNTS=()
+
+# add_bind_mount <host path> <container path> [mount option …]
+add_bind_mount() {
+    local host_path="$1" container_path="$2"
+    shift 2
+    local -a opts=("$@" "${SHARED_LABEL_OPTS[@]}")
+    local spec="$host_path:$container_path"
+    if (( ${#opts[@]} )); then
+        local IFS=,
+        spec+=":${opts[*]}"
+    fi
+    MOUNTS+=(-v "$spec")
+}
+
+EMPTY_DIR_OPTS="ro,noexec,nosuid,nodev"
+
+# add_empty_dir <container path>
+add_empty_dir() {
+    MOUNTS+=(--tmpfs "$1:$EMPTY_DIR_OPTS")
+}
 
 # ── TTY detection ─────────────────────────────────────────────────────────────
 # -it only for a real terminal, so that  echo … | claude  keeps working.
@@ -154,7 +173,7 @@ mask_tree() {
     while IFS= read -r path; do
         rel="${path#"$host_root"/}"
         if [[ -d "$path" ]]; then
-            SECRET_MASKS+=(--tmpfs "$container_root/$rel:ro,noexec,nosuid,nodev")
+            SECRET_MASKS+=(--tmpfs "$container_root/$rel:$EMPTY_DIR_OPTS")
         else
             [[ "$path" == *.json ]] && stub="$MASK_STUB_JSON" || stub="/dev/null"
             SECRET_MASKS+=(-v "$stub:$container_root/$rel:ro")
@@ -181,9 +200,7 @@ done
 # this wrapper invisible to git: skip-worktree on every tracked path a mask
 # covers, and an exclude entry for the rest. It lives inside the host .git dir,
 # which keeps cp -al on one filesystem and out of the workspace listing.
-GIT_MOUNT=()
-
-prepare_git_snapshot() {
+add_git_snapshot_mount() {
     local gitdir="$HOST_WORKDIR/.git"
     [[ -d "$gitdir" ]] || return 0
 
@@ -241,24 +258,26 @@ prepare_git_snapshot() {
         printf '/%s\n' "$rel" >> "$snap/info/exclude"
     done
 
-    GIT_MOUNT=(-v "$snap:$CONTAINER_WORKDIR/.git:ro$Z")
+    add_bind_mount "$snap" "$CONTAINER_WORKDIR/.git" ro
 }
 
-prepare_git_snapshot
+add_bind_mount "$CLAUDE_HOME" /home/claude
+add_bind_mount "$HOST_WORKDIR" "$CONTAINER_WORKDIR"
+add_git_snapshot_mount
+add_bind_mount "$HOME/planning" "$CONTAINER_WORKDIR/planning"
+add_empty_dir "$CONTAINER_WORKDIR/planning/.git"
 
 # ── Run ───────────────────────────────────────────────────────────────────────
+# Masks come last so they overlay the mounts above. --network=bridge keeps the
+# container off the host's own LAN address, behind NAT.
 exec podman run \
     "${TTY_FLAGS[@]}" \
     --rm \
     --userns=keep-id \
     --cap-drop=ALL \
     --security-opt=no-new-privileges:true \
-    -v "$CLAUDE_HOME:/home/claude$Z" \
-    -v "$CLAUDE_CREDS_DIR/.claude/credentials.json:/home/claude/.claude/credentials.json:ro$Z" \
-    -v "$HOST_WORKDIR:$CONTAINER_WORKDIR$Z" \
-    "${GIT_MOUNT[@]}" \
-    -v "$HOME/planning:$CONTAINER_WORKDIR/planning$Z" \
-    --tmpfs "$CONTAINER_WORKDIR/planning/.git:ro,noexec,nosuid,nodev" \
+    --network=bridge \
+    "${MOUNTS[@]}" \
     "${SECRET_MASKS[@]}" \
     --workdir "$CONTAINER_WORKDIR" \
     "$IMAGE_NAME:$IMAGE_TAG" \
