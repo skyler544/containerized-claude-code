@@ -48,14 +48,12 @@ if [[ -t 0 ]]; then
     TTY_FLAGS=(-it)
 fi
 
-# ── Git read-only mount ────────────────────────────────────────────────────────
-# If the workspace has a .git dir, mount it read-only so git log/diff/status
-# work but git add/commit/push always fail with a permission error.
-# Skipped when there is no .git to avoid Docker creating a spurious empty dir.
-GIT_MOUNT=()
-if [[ -d "$HOST_WORKDIR/.git" ]]; then
-    GIT_MOUNT=(-v "$HOST_WORKDIR/.git:$CONTAINER_WORKDIR/.git:ro$Z")
-fi
+# ── Mounts that exist only in the container ───────────────────────────────────
+# Paths that the container gets as a mount but that git in the workspace must
+# not report. They are added to the exclude list of the git snapshot below.
+MOUNT_ONLY_RELPATHS=(
+    'planning'
+)
 
 # ── Secret masking ────────────────────────────────────────────────────────────
 # The whole working directory is bind-mounted, so secret files inside it would
@@ -63,7 +61,7 @@ fi
 # secret is instead covered by a second mount:
 #   * a .json file -> a read-only stub that holds "{}", so a parser still works
 #   * any other file -> /dev/null, read-only, which reads as empty
-#   * a directory  -> an empty tmpfs
+#   * a directory  -> an empty read-only tmpfs
 # The name still appears in listings, but the content never enters the
 # container. Masks are passed last so they overlay the parent mounts.
 #
@@ -115,10 +113,14 @@ chmod 444 "$MASK_STUB_JSON"
 
 SECRET_MASKS=()
 
-# mask_tree <host root> <container root>
+# Every masked path, relative to the workspace root. The git snapshot below
+# uses this list, so a path must never be masked without being recorded here.
+MASK_RELPATHS=()
+
+# mask_tree <host root> <container root> <prefix below the workspace root>
 # Finds secrets under the host root and appends the matching mounts.
 mask_tree() {
-    local host_root="$1" container_root="$2"
+    local host_root="$1" container_root="$2" prefix="${3:-}"
     [[ -d "$host_root" ]] || return 0
 
     local -a find_args=("$host_root" -maxdepth 6)
@@ -171,19 +173,118 @@ mask_tree() {
     while IFS= read -r path; do
         rel="${path#"$host_root"/}"
         if [[ -d "$path" ]]; then
-            SECRET_MASKS+=(--tmpfs "$container_root/$rel:noexec,nosuid,nodev")
+            # ro as well: a writable mask lets an edit inside the container
+            # disappear without a trace, which the skip-worktree bit set below
+            # would then also keep out of git status.
+            SECRET_MASKS+=(--tmpfs "$container_root/$rel:ro,noexec,nosuid,nodev")
         else
             [[ "$path" == *.json ]] && stub="$MASK_STUB_JSON" || stub="/dev/null"
             SECRET_MASKS+=(-v "$stub:$container_root/$rel:ro")
         fi
-        if [[ -n "${CLAUDE_MASK_VERBOSE:-}" ]]; then
-            echo "claude: hiding $rel" >&2
-        fi
+        MASK_RELPATHS+=("${prefix:+$prefix/}$rel")
     done < <(find "${find_args[@]}" 2>/dev/null)
 }
 
-mask_tree "$HOST_WORKDIR" "$CONTAINER_WORKDIR"
-mask_tree "$HOME/planning" "$CONTAINER_WORKDIR/planning"
+mask_tree "$HOST_WORKDIR" "$CONTAINER_WORKDIR" ""
+mask_tree "$HOME/planning" "$CONTAINER_WORKDIR/planning" "planning"
+
+# Every mask must be read-only before a single skip-worktree bit is set below.
+for spec in "${SECRET_MASKS[@]}"; do
+    case "$spec" in
+        -v|--tmpfs|*:ro|*:ro,*) ;;
+        *) echo "claude: mask is not read-only, refusing to start: $spec" >&2; exit 1 ;;
+    esac
+done
+
+# ── Git snapshot for the container ────────────────────────────────────────────
+# The container gets a private, read-only copy of the git dir instead of the
+# live one. git log/diff/status keep working, git add/commit/push still fail on
+# the read-only mount, and the copy carries two pieces of extra state so that
+# the mounts of this wrapper produce no phantom changes:
+#
+#   * skip-worktree on every tracked path that a mask covers, so the masked
+#     (empty) content does not read as a modification or a deletion. This is
+#     safe only because each such path is a read-only mount, asserted above:
+#     no real edit can be made to it, so none can be swallowed.
+#   * an exclude entry for every masked path that git does not track and for
+#     each mount-only path, so nothing shows up as untracked.
+#
+# The copy lives inside the host .git dir. That keeps it on the same filesystem,
+# so cp -al hardlinks instead of duplicating the object store, and keeps it out
+# of the workspace listing. It is a snapshot: a commit or a branch switch on the
+# host during a session is not picked up until the next start.
+GIT_MOUNT=()
+
+prepare_git_snapshot() {
+    local gitdir="$HOST_WORKDIR/.git"
+    [[ -d "$gitdir" ]] || return 0
+
+    local snap="$gitdir/claude-snapshot.$$"
+
+    # No trap can clean up after the exec below. The name carries the PID of
+    # this wrapper, and exec keeps that PID for the container, so a snapshot
+    # whose PID is gone belongs to a finished session. Age is the fallback for
+    # the case where the number was handed out again in the meantime.
+    local old pid
+    for old in "$gitdir"/claude-snapshot.*; do
+        [[ -d "$old" ]] || continue
+        pid="${old##*.}"
+        if [[ "$pid" == "$$" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            rm -rf "$old"
+        fi
+    done
+    find "$gitdir" -maxdepth 1 -name 'claude-snapshot.*' -mtime +0 \
+        -exec rm -rf {} + 2>/dev/null || true
+    mkdir -p "$snap"
+
+    local entry name
+    for entry in "$gitdir"/* "$gitdir"/.[!.]*; do
+        [[ -e "$entry" ]] || continue
+        name="${entry##*/}"
+        [[ "$name" == claude-snapshot.* ]] && continue
+        cp -al "$entry" "$snap/" 2>/dev/null || cp -a "$entry" "$snap/"
+    done
+
+    # cp -al hardlinks, so the copy and the host file are the same inode: a
+    # write through the copy would reach the host repository. Break the link on
+    # every file this wrapper writes to.
+    local -a git_cmd=(git --git-dir="$snap" --work-tree="$HOST_WORKDIR")
+    mkdir -p "$snap/info"
+    local f
+    for f in "$snap/index" "$snap/info/exclude"; do
+        [[ -f "$f" ]] || continue
+        cp "$f" "$f.claude" && mv -f "$f.claude" "$f"
+    done
+    printf '\n# claude wrapper: masked and mount-only paths\n' >> "$snap/info/exclude"
+
+    # The NUL-separated list goes through a file, not a variable: command
+    # substitution drops NUL bytes and would join the paths into one.
+    # A mask hides the file in the worktree, not the commits behind it: where a
+    # masked path is tracked, the container still reads the committed content
+    # with git show. Only an untracked path is fully hidden.
+    local rel list
+    list="$(mktemp)"
+    for rel in "${MASK_RELPATHS[@]}"; do
+        # -z keeps a path with a space or a newline in it intact. A path that
+        # ls-files does not return is not in the index, and update-index would
+        # fail on it, so it becomes an exclude entry instead.
+        "${git_cmd[@]}" ls-files -z -- "$rel" > "$list" 2>/dev/null || true
+        if [[ -s "$list" ]]; then
+            xargs -0 -r "${git_cmd[@]}" update-index --skip-worktree -- < "$list"
+        else
+            printf '/%s\n' "$rel" >> "$snap/info/exclude"
+        fi
+    done
+    rm -f "$list"
+
+    for rel in "${MOUNT_ONLY_RELPATHS[@]}"; do
+        printf '/%s\n' "$rel" >> "$snap/info/exclude"
+    done
+
+    GIT_MOUNT=(-v "$snap:$CONTAINER_WORKDIR/.git:ro$Z")
+}
+
+prepare_git_snapshot
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 exec podman run \
@@ -197,7 +298,7 @@ exec podman run \
     -v "$HOST_WORKDIR:$CONTAINER_WORKDIR$Z" \
     "${GIT_MOUNT[@]}" \
     -v "$HOME/planning:$CONTAINER_WORKDIR/planning$Z" \
-    --tmpfs "$CONTAINER_WORKDIR/planning/.git:noexec,nosuid,nodev" \
+    --tmpfs "$CONTAINER_WORKDIR/planning/.git:ro,noexec,nosuid,nodev" \
     "${SECRET_MASKS[@]}" \
     --workdir "$CONTAINER_WORKDIR" \
     "$IMAGE_NAME:$IMAGE_TAG" \
