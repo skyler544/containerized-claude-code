@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
 # The requirements of the claude wrapper, as assertions.
-#
-# The wrapper is run against a fake podman that records its arguments, so no
-# container is started and nothing on the host is touched outside a temp dir.
-#
-# Usage: ./test-claude-wrapper
-
 set -uo pipefail
 
 WRAPPER="$(dirname "$(readlink -f "$0")")/claude"
@@ -19,7 +13,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 requirement() { printf '\n%s\n' "$1"; }
 
-check() { # check <description> <command …>
+check() {
     local description="$1"
     shift
     if "$@" >/dev/null 2>&1; then
@@ -43,7 +37,6 @@ status_hides()  { ! container_git status --short | grep -qE -- "$1"; }
 status_shows()  { container_git status --short | grep -qE -- "$1"; }
 
 # ── Fixture ───────────────────────────────────────────────────────────────────
-# A repository holding every case the wrapper has to tell apart.
 build_fixture() {
     rm -rf "$TMP/bin" "$TMP/home" "$REPO" "$TMP/plain"
     mkdir -p "$TMP/bin" "$TMP/home/planning" "$REPO" "$TMP/plain"
@@ -83,7 +76,7 @@ FAKE_PODMAN
     printf 'new\n'         > "$REPO/newfile.txt"
 }
 
-run_wrapper() { # run_wrapper <working directory> [extra PATH entry]
+run_wrapper() {
     local workdir="$1" extra_path="${2:-}"
     ( cd "$workdir" \
       && HOME="$TMP/home" \
@@ -92,7 +85,6 @@ run_wrapper() { # run_wrapper <working directory> [extra PATH entry]
          bash "$WRAPPER" "explain this codebase" ) > "$OUTPUT" 2>&1 < /dev/null
 }
 
-# Same, with a pty on stdin. Needs script(1); the caller skips without it.
 run_wrapper_on_a_terminal() {
     script -qec "cd '$REPO' \
         && HOME='$TMP/home' PATH='$TMP/bin:$PATH' PODMAN_ARGS='$ARGS' \
@@ -131,7 +123,6 @@ check "working directory in the workspace"         has_spec ":/home/claude/works
 check "starts in the workspace"                    has_arg "/home/claude/workspace/repo"
 check "no separate credentials mount"              lacks_spec 'credentials'
 check "planning dir mounted into the workspace"    has_spec ":/home/claude/workspace/repo/planning$"
-check "planning is no repository of its own"       has_spec '/planning/\.git:ro,noexec,nosuid,nodev$'
 
 requirement "Secret masking"
 check "secret file reads as empty"                 has_spec '^/dev/null:.*/repo/\.env:ro$'
@@ -148,6 +139,7 @@ check "the container's .git is a session snapshot" has_spec 'claude-session\..*:
 check "reading history works"                      container_git log --oneline
 check "no masked path is reported"                 status_hides '\.env$|\.npmrc|secrets/|settings\.json'
 check "the planning mount is not reported"         status_hides 'planning'
+check "planning's .git is also a session snapshot" has_spec 'claude-session\..*:/home/claude/workspace/repo/planning/\.git:ro'
 check "a real edit is still reported"              status_shows '^ M main\.txt$'
 check "a real new file is still reported"          status_shows '^\?\? newfile\.txt$'
 

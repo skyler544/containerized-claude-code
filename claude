@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
-# Wrapper that runs Claude Code inside a podman container.
-# Drop this in ~/.local/bin/claude (or any directory on your PATH) and chmod +x it.
-#
-# Usage: claude [any claude-code args]
-
 set -euo pipefail
 
 IMAGE_NAME="claude-cli"
 IMAGE_TAG="latest"
 
-# Session state: settings, history, credentials.
 CLAUDE_HOME="$HOME/.cache/claude-home"
 
 # ── Workspace ─────────────────────────────────────────────────────────────────
@@ -18,19 +12,13 @@ PROJECT_NAME="$(basename "$PWD")"
 CONTAINER_WORKDIR="/home/claude/workspace/$PROJECT_NAME"
 
 # ── Host path mounts ──────────────────────────────────────────────────────────
-# Relabeling needs the SELinux module loaded; with SELinux off it fails with
-# EPERM. The shared label 'z' is required, not the private 'Z': a private label
-# would stop a second container from mounting the same host directory, so two
-# agents could not work in one code base at the same time.
 SHARED_LABEL_OPTS=()
 if [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
     SHARED_LABEL_OPTS=(z)
 fi
 
-# Ordered podman mount arguments. Later entries overlay earlier ones.
 MOUNTS=()
 
-# add_bind_mount <host path> <container path> [mount option …]
 add_bind_mount() {
     local host_path="$1" container_path="$2"
     shift 2
@@ -45,29 +33,13 @@ add_bind_mount() {
 
 EMPTY_DIR_OPTS="ro,noexec,nosuid,nodev"
 
-# add_empty_dir <container path>
-add_empty_dir() {
-    MOUNTS+=(--tmpfs "$1:$EMPTY_DIR_OPTS")
-}
-
 # ── TTY detection ─────────────────────────────────────────────────────────────
-# -it only for a real terminal, so that  echo … | claude  keeps working.
 TTY_FLAGS=()
 if [[ -t 0 ]]; then
     TTY_FLAGS=(-it)
 fi
 
 # ── Secret masking ────────────────────────────────────────────────────────────
-# A bind mount cannot exclude a sub-path, so every secret under the mounted
-# working directory is covered by a second mount:
-#   * a .json file    -> a read-only stub holding "{}", so a parser still works
-#   * any other file  -> /dev/null, read-only
-#   * a directory     -> an empty read-only tmpfs
-# The name stays visible, the content does not. Masks are passed to podman last
-# so they overlay the parent mounts. No :z on them: /dev/null must not be
-# relabeled and a tmpfs needs no label.
-
-# Hidden by base name.
 SECRET_FILE_GLOBS=(
     '.env' '.env.*'
     '.netrc' '.npmrc' '.pgpass' '.htpasswd' '.dockercfg'
@@ -76,59 +48,40 @@ SECRET_FILE_GLOBS=(
     'credentials' 'credentials.json' 'service-account*.json'
     'secrets.yml' 'secrets.yaml' 'secrets.json'
 )
-
-# Hidden by path, for names that are only sensitive in a certain place. A
-# project-local Claude settings file can grant permissions and register hooks,
-# so the container takes its rules from the mounted Claude home dir instead.
 SECRET_PATH_GLOBS=(
     '.claude/settings*.json'
 )
-
-# Templates that hold no real values and stay visible.
-SECRET_FILE_KEEP=(
-    '.env.example' '.env.sample' '.env.dist' '.env.template'
-    '*.pem.example' '*.key.example'
-)
-
 SECRET_DIR_GLOBS=(
     '.ssh' '.gnupg' '.aws' '.kube' '.docker' '.gcloud'
     'secrets' 'secret'
 )
-
-# Never searched: large, or mounted separately.
 SECRET_SKIP_DIRS=(
     '.git' 'node_modules' 'vendor' 'dist' 'build' '.cache'
 )
 
-# Bounds the startup scan. A secret nested deeper than this is not masked.
 MASK_SEARCH_DEPTH=6
-
 EMPTY_FILE="/dev/null"
 
-# An empty file makes some readers report a parse error, so the stub holds {}.
 MASK_STUB_JSON="$CLAUDE_HOME/.mask/empty.json"
 mkdir -p "$(dirname "$MASK_STUB_JSON")"
 rm -f "$MASK_STUB_JSON"
 printf "{}\\n" > "$MASK_STUB_JSON"
 chmod 444 "$MASK_STUB_JSON"
 
-# Masks, and the same paths relative to the workspace root for the git snapshot.
 SECRET_MASKS=()
-MASK_RELPATHS=()
+WORKSPACE_MASK_RELPATHS=()
+PLANNING_MASK_RELPATHS=()
 
-# mask_file <container path>
 mask_file() {
     local stub="$EMPTY_FILE"
     [[ "$1" == *.json ]] && stub="$MASK_STUB_JSON"
     SECRET_MASKS+=(-v "$stub:$1:ro")
 }
 
-# mask_dir <container path>
 mask_dir() {
     SECRET_MASKS+=(--tmpfs "$1:$EMPTY_DIR_OPTS")
 }
 
-# append_glob_group <array name> <find predicate> <glob …>  ->  ( -name a -o -name b )
 append_glob_group() {
     local -n group_out="$1"
     local predicate="$2"
@@ -143,17 +96,13 @@ append_glob_group() {
     group_out+=(')')
 }
 
-# mask_tree <host root> <container root>
 mask_tree() {
     local host_root="$1" container_root="$2"
+    local -n relpaths_out="$3"
     [[ -d "$host_root" ]] || return 0
-
-    local prefix="${container_root#"$CONTAINER_WORKDIR"}"
-    prefix="${prefix#/}"
 
     local -a find_args=("$host_root" -maxdepth "$MASK_SEARCH_DEPTH")
 
-    # Pruned first, so the skip list also covers the directory matches.
     append_glob_group find_args -name "${SECRET_SKIP_DIRS[@]}"
     find_args+=(-prune -o)
 
@@ -163,13 +112,8 @@ mask_tree() {
 
     find_args+=(-type f)
     append_glob_group find_args -name "${SECRET_FILE_GLOBS[@]}"
-    local keep
-    for keep in "${SECRET_FILE_KEEP[@]}"; do
-        find_args+=(! -name "$keep")
-    done
     find_args+=(-print -o)
 
-    # Each path glob applies at the root and anywhere below it.
     local -a path_globs=() glob
     for glob in "${SECRET_PATH_GLOBS[@]}"; do
         path_globs+=("$host_root/$glob" "$host_root/*/$glob")
@@ -186,24 +130,15 @@ mask_tree() {
         else
             mask_file "$container_root/$rel"
         fi
-        MASK_RELPATHS+=("${prefix:+$prefix/}$rel")
+        relpaths_out+=("$rel")
     done < <(find "${find_args[@]}" 2>/dev/null)
 }
 
 # ── Git snapshot ──────────────────────────────────────────────────────────────
-# The container gets a private read-only copy of the git dir, so git log/diff/
-# status work while add/commit/push fail. The copy is also what makes the mounts
-# of this wrapper invisible to git. It lives inside the host .git dir, which
-# keeps cp -al on one filesystem and out of the workspace listing.
 SESSION_SNAPSHOT_PREFIX="claude-session"
-
-# Workspace-relative paths that git must not report at all.
 GIT_EXCLUDE_RELPATHS=()
+NO_EXTRA_EXCLUDES=()
 
-# remove_finished_session_snapshots <git dir>
-# No trap can run after the exec below, and exec hands this PID to the
-# container, so a snapshot named after a PID that is gone is from a finished
-# session. Age covers a PID that has since been handed out again.
 remove_finished_session_snapshots() {
     local gitdir="$1" snapshot pid
     for snapshot in "$gitdir/$SESSION_SNAPSHOT_PREFIX".*; do
@@ -217,7 +152,6 @@ remove_finished_session_snapshots() {
         -exec rm -rf {} + 2>/dev/null || true
 }
 
-# copy_git_dir <git dir> <destination>
 copy_git_dir() {
     local gitdir="$1" dest="$2" entry name written
     mkdir -p "$dest"
@@ -228,8 +162,6 @@ copy_git_dir() {
         cp -al "$entry" "$dest/" 2>/dev/null || cp -a "$entry" "$dest/"
     done
 
-    # The copy shares inodes with the host repository, so break the link on
-    # every file written afterwards.
     mkdir -p "$dest/info"
     for written in "$dest/index" "$dest/info/exclude"; do
         [[ -f "$written" ]] || continue
@@ -237,21 +169,17 @@ copy_git_dir() {
     done
 }
 
-# hide_wrapper_mounts_from_git <git dir copy>
-# skip-worktree keeps a masked tracked path from reading as a modification or a
-# deletion; anything git does not track becomes an exclude entry.
 hide_wrapper_mounts_from_git() {
-    local snapshot="$1"
-    local -a git_cmd=(git --git-dir="$snapshot" --work-tree="$HOST_WORKDIR")
+    local snapshot="$1" worktree="$2"
+    local -n relpaths_in="$3"
+    local -n extra_excludes="$4"
+    local -a git_cmd=(git --git-dir="$snapshot" --work-tree="$worktree")
     local rel list
 
     printf '\n# claude wrapper: masked and mounted paths\n' >> "$snapshot/info/exclude"
 
-    # ls-files output goes through a file because command substitution drops
-    # the NUL separators. A path it does not return is not in the index, where
-    # update-index would fail.
     list="$(mktemp)"
-    for rel in "${MASK_RELPATHS[@]}"; do
+    for rel in "${relpaths_in[@]}"; do
         "${git_cmd[@]}" ls-files -z -- "$rel" > "$list" 2>/dev/null || true
         if [[ -s "$list" ]]; then
             xargs -0 -r "${git_cmd[@]}" update-index --skip-worktree -- < "$list"
@@ -261,45 +189,39 @@ hide_wrapper_mounts_from_git() {
     done
     rm -f "$list"
 
-    for rel in "${GIT_EXCLUDE_RELPATHS[@]}"; do
+    for rel in "${extra_excludes[@]}"; do
         printf '/%s\n' "$rel" >> "$snapshot/info/exclude"
     done
 }
 
-add_git_snapshot_mount() {
-    local gitdir="$HOST_WORKDIR/.git"
+add_git_snapshot() {
+    local worktree="$1" gitdir="$2" container_git_path="$3" relpaths_name="$4" extra_excludes_name="$5"
     [[ -d "$gitdir" ]] || return 0
 
     local snapshot="$gitdir/$SESSION_SNAPSHOT_PREFIX.$$"
     remove_finished_session_snapshots "$gitdir"
     copy_git_dir "$gitdir" "$snapshot"
-    hide_wrapper_mounts_from_git "$snapshot"
-    add_bind_mount "$snapshot" "$CONTAINER_WORKDIR/.git" ro
+    hide_wrapper_mounts_from_git "$snapshot" "$worktree" "$relpaths_name" "$extra_excludes_name"
+    add_bind_mount "$snapshot" "$container_git_path" ro
 }
 
-# planning_directory <host path> <name in the workspace>
-# A host directory mounted into the workspace: writable, masked like the
-# workspace itself, no repository of its own, and never reported by the
-# workspace's git.
 planning_directory() {
     local host_path="$1" name="$2"
     local container_path="$CONTAINER_WORKDIR/$name"
 
     add_bind_mount "$host_path" "$container_path"
-    add_empty_dir "$container_path/.git"
-    mask_tree "$host_path" "$container_path"
+    mask_tree "$host_path" "$container_path" PLANNING_MASK_RELPATHS
+    add_git_snapshot "$host_path" "$host_path/.git" "$container_path/.git" PLANNING_MASK_RELPATHS NO_EXTRA_EXCLUDES
     GIT_EXCLUDE_RELPATHS+=("$name")
 }
 
 add_bind_mount "$CLAUDE_HOME" /home/claude
 add_bind_mount "$HOST_WORKDIR" "$CONTAINER_WORKDIR"
-mask_tree "$HOST_WORKDIR" "$CONTAINER_WORKDIR"
+mask_tree "$HOST_WORKDIR" "$CONTAINER_WORKDIR" WORKSPACE_MASK_RELPATHS
 planning_directory "$HOME/planning" planning
-add_git_snapshot_mount
+add_git_snapshot "$HOST_WORKDIR" "$HOST_WORKDIR/.git" "$CONTAINER_WORKDIR/.git" WORKSPACE_MASK_RELPATHS GIT_EXCLUDE_RELPATHS
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-# Masks come last so they overlay the mounts above. --network=bridge keeps the
-# container off the host's own LAN address, behind NAT.
 exec podman run \
     "${TTY_FLAGS[@]}" \
     --rm \
