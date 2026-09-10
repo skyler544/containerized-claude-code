@@ -1,0 +1,98 @@
+#!/bin/sh
+# git inside the container.
+#
+# The git dir is the host's own, mounted read only, and some paths of the
+# working tree are not mounted. Git must not report those paths, and it must
+# not report a difference that only the host's own branch state explains.
+#
+# This shim gives git a private index in the container. The index is a copy of
+# the host index with a skip-worktree bit on each path that the wrapper keeps
+# out of the container. Git then reports neither a change nor a deletion for
+# them. The copy follows the host index, thus a branch switch or a rebase on
+# the host stays correct.
+set -u
+
+REAL_GIT="${CLAUDE_REAL_GIT:-/usr/bin/git}"
+STATE_ROOT="${CLAUDE_GIT_STATE:-/tmp/claude-git}"
+MASK_DIR="${CLAUDE_MASK_DIR:-}"
+
+if [ -z "$MASK_DIR" ] || [ ! -f "$MASK_DIR/exclusions" ]; then
+    exec "$REAL_GIT" "$@"
+fi
+
+# The leading global options decide which repository git works on, thus the
+# lookup below must see them too.
+global_options() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -C|-c|--git-dir|--work-tree|--namespace|--exec-path)
+                printf '%s\n%s\n' "$1" "${2:-}"
+                shift 2 || break
+                ;;
+            --git-dir=*|--work-tree=*|--namespace=*|--exec-path=*|-c*)
+                printf '%s\n' "$1"
+                shift
+                ;;
+            -p|--paginate|-P|--no-pager|--bare|--no-replace-objects|\
+            --literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|\
+            --icase-pathspecs|--no-optional-locks)
+                printf '%s\n' "$1"
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+}
+
+OLD_IFS="$IFS"
+IFS='
+'
+set -f
+GLOBALS="$(global_options "$@")"
+
+top="$("$REAL_GIT" $GLOBALS rev-parse --show-toplevel 2>/dev/null)" || top=""
+gitdir="$("$REAL_GIT" $GLOBALS rev-parse --absolute-git-dir 2>/dev/null)" || gitdir=""
+
+set +f
+IFS="$OLD_IFS"
+
+if [ -z "$top" ] || [ -z "$gitdir" ] || [ ! -f "$gitdir/index" ]; then
+    exec "$REAL_GIT" "$@"
+fi
+
+state="$STATE_ROOT/$(printf '%s' "$top" | tr / _)"
+index="$state/index"
+stamp="$state/stamp"
+
+# Which host index the private copy comes from. Git writes a new index file
+# and renames it, thus the inode changes at every write on the host. A time
+# stamp alone is not sufficient, because the shell compares whole seconds.
+host_state="$(stat -c '%i %s %Y' "$gitdir/index" 2>/dev/null || echo unknown)"
+copy_state="$(cat "$stamp" 2>/dev/null || true)"
+
+if [ ! -f "$index" ] || [ "$host_state" != "$copy_state" ]; then
+    # A private name for the build, thus two git calls at the same time cannot
+    # read a half written index.
+    new="$index.$$"
+    mkdir -p "$state" || exec "$REAL_GIT" "$@"
+    cp "$gitdir/index" "$new" || exec "$REAL_GIT" "$@"
+
+    # An exclusion names a file or a directory. ls-files turns both into the
+    # tracked paths that the index knows, which is what update-index takes.
+    paths="$new.paths"
+    awk -F '\t' -v top="$top" '$1 == top { print $2 }' \
+        "$MASK_DIR/exclusions" > "$paths"
+    if [ -s "$paths" ]; then
+        tr '\n' '\0' < "$paths" |
+        xargs -0 "$REAL_GIT" -C "$top" ls-files -z -- 2>/dev/null |
+        GIT_INDEX_FILE="$new" "$REAL_GIT" -C "$top" \
+            update-index --skip-worktree -z --stdin 2>/dev/null
+    fi
+    rm -f "$paths"
+    mv -f "$new" "$index"
+    printf '%s' "$host_state" > "$stamp"
+fi
+
+GIT_INDEX_FILE="$index" exec "$REAL_GIT" "$@"

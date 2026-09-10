@@ -2,11 +2,15 @@
 # The requirements of the claude wrapper, as assertions.
 set -uo pipefail
 
-WRAPPER="$(dirname "$(readlink -f "$0")")/claude"
+HERE="$(dirname "$(readlink -f "$0")")"
+WRAPPER="$HERE/claude"
+SHIM="$HERE/container-git"
 TMP="$(mktemp -d)"
 ARGS="$TMP/podman-args"
 OUTPUT="$TMP/wrapper-output"
 REPO="$TMP/repo"
+MOUNTED="$TMP/mounted"
+MASK_DIR="$TMP/home/.cache/claude-home/.mask"
 FAILURES=0
 
 trap 'rm -rf "$TMP"' EXIT
@@ -31,10 +35,105 @@ has_spec()     { grep -qE -- "$1" "$ARGS"; }
 lacks_spec()   { ! grep -qE -- "$1" "$ARGS"; }
 line_of()      { grep -nE -- "$1" "$ARGS" | head -1 | cut -d: -f1; }
 
-container_git() { git --git-dir="$SNAPSHOT" --work-tree="$REPO" "$@"; }
-write_fails()   { ! container_git add newfile.txt; }
-status_hides()  { ! container_git status --short | grep -qE -- "$1"; }
-status_shows()  { container_git status --short | grep -qE -- "$1"; }
+# ── The container's view ──────────────────────────────────────────────────────
+# Builds the working directory that the container gets, from the podman
+# arguments. It applies each mount and each mask in the order of podman.
+materialize_workspace() {
+    local prefix="/home/claude/workspace/repo/" line src rest dst
+    rm -rf "$MOUNTED" "$TMP/mask"
+    [[ "${KEEP_GIT_STATE:-0}" == 1 ]] || rm -rf "$TMP/gitstate"
+    cp -a "$REPO" "$MOUNTED"
+    while IFS= read -r line; do
+        if [[ "$line" == "$prefix"* ]]; then
+            dst="${line%%:*}"
+            dst="$MOUNTED/${dst#"$prefix"}"
+            rm -rf "$dst"
+            mkdir -p "$dst"
+            continue
+        fi
+        src="${line%%:*}"
+        rest="${line#*:}"
+        dst="${rest%%:*}"
+        [[ "$dst" == "$prefix"* ]] || continue
+        dst="$MOUNTED/${dst#"$prefix"}"
+        rm -rf "$dst"
+        mkdir -p "$(dirname "$dst")"
+        if [[ -d "$src" ]]; then
+            # A bind mount follows a symlink of the source, thus the container
+            # gets the directory behind it, never the link.
+            mkdir -p "$dst"
+            cp -a "$src"/. "$dst"/
+        elif [[ "$src" == /dev/null ]]; then
+            : > "$dst"
+        else
+            cp "$src" "$dst"
+        fi
+    done < <(grep -E "^([^:]+:)?$prefix" "$ARGS")
+    chmod -R u+w "$MOUNTED"
+
+    # The git shim of the container reads the exclusion list of this session.
+    mkdir -p "$TMP/mask"
+    sed "s|^/home/claude/workspace/repo|$MOUNTED|" \
+        "$(ls -dt "$MASK_DIR"/session.*/ | head -1)/exclusions" \
+        > "$TMP/mask/exclusions"
+}
+
+# git as the container runs it: the shim, the exclusion list, and a private
+# index in a state directory that the container throws away.
+container_git() {
+    CLAUDE_MASK_DIR="$TMP/mask" \
+    CLAUDE_GIT_STATE="$TMP/gitstate" \
+    CLAUDE_REAL_GIT="$(command -v git)" \
+        sh "$SHIM" -C "$MOUNTED" "$@"
+}
+
+# The command must be printable without a container, so that a real run can be
+# compared against it.
+prints_its_command() {
+    local printed
+    printed="$( cd "$REPO" \
+        && HOME="$TMP/home" PATH="$TMP/bin:$PATH" PODMAN_ARGS="$TMP/unused" \
+           CLAUDE_PRINT_COMMAND=1 bash "$WRAPPER" 2>/dev/null )"
+    [[ ! -e "$TMP/unused" ]] \
+        && grep -qx 'podman' <<< "$printed" \
+        && grep -q '^/dev/null:' <<< "$printed"
+}
+
+plain_git_reports() { git -C "$MOUNTED" status --short | grep -qE -- "$1"; }
+
+planning_git() {
+    CLAUDE_MASK_DIR="$TMP/mask" \
+    CLAUDE_GIT_STATE="$TMP/gitstate" \
+    CLAUDE_REAL_GIT="$(command -v git)" \
+        sh "$SHIM" -C "$MOUNTED/planning" "$@"
+}
+planning_status_hides() { ! planning_git status --short | grep -qE -- "$1"; }
+
+# No path of the exclusion list, and nothing below it, may show up in the
+# status of the container.
+no_excluded_path_reported() {
+    local status paths rel path
+    status="$(container_git status --short)"
+    paths="$(printf '%s\n' "$status" | awk 'NF { print $NF }')"
+    while IFS="$(printf '\t')" read -r _ rel; do
+        [[ -n "$rel" ]] || continue
+        while IFS= read -r path; do
+            path="${path%/}"
+            if [[ "$path" == "$rel" || "$path" == "$rel/"* ]]; then
+                printf 'reported: %s\n' "$path" >&2
+                return 1
+            fi
+        done <<< "$paths"
+    done < "$TMP/mask/exclusions"
+    return 0
+}
+
+status_hides()     { ! container_git status --short | grep -qE -- "$1"; }
+status_shows()     { container_git status --short | grep -qE -- "$1"; }
+status_is_clean()  { [[ -z "$(container_git status --short)" ]]; }
+excludes()         { grep -qE -- "$1" "$TMP/mask/exclusions"; }
+host_write_fails() { ! git -C "$REPO" add newfile.txt; }
+no_secret_leak()   { ! grep -rqI LEAK "$MOUNTED" --exclude-dir=.git; }
 
 # ── Fixture ───────────────────────────────────────────────────────────────────
 build_fixture() {
@@ -52,26 +151,49 @@ FAKE_PODMAN
     chmod +x "$TMP/selinux-bin/getenforce"
 
     printf 'note\n' > "$TMP/home/planning/notes.md"
+    printf 'KEY=LEAK\n' > "$TMP/home/planning/.env"
     git -C "$TMP/home/planning" init -q .
 
-    git -C "$REPO" init -q .
+    git -C "$REPO" init -q -b main .
     git -C "$REPO" config user.email test@example.com
     git -C "$REPO" config user.name test
-    mkdir -p "$REPO/secrets" "$REPO/.claude" "$REPO/node_modules" \
+    mkdir -p "$REPO/secrets" "$REPO/.claude/commands" "$REPO/node_modules" \
              "$REPO/deep/1/2/3/4/5"
+
+    # Tracked files, tracked secrets among them.
     printf 'code\n'        > "$REPO/main.txt"
     printf 'token\n'       > "$REPO/.npmrc"
     printf 'x\n'           > "$REPO/secrets/a.txt"
-    printf 'y\n'           > "$REPO/secrets/b.txt"
     printf '{"p":1}\n'     > "$REPO/.claude/settings.json"
+    printf 'do a thing\n'  > "$REPO/.claude/commands/hello.md"
+
+    # A tracked symlink beside the settings file. A bind mount turns it into a
+    # directory, and git must still say nothing about it.
+    mkdir -p "$REPO/.agents/skills"
+    printf 'skill\n' > "$REPO/.agents/skills/one.md"
+    ln -s ../.agents/skills "$REPO/.claude/skills"
     git -C "$REPO" add -A
     git -C "$REPO" commit -qm init
 
-    printf 'SECRET=1\n'    > "$REPO/.env"
+    # The local content of those secrets. None of it may reach the container.
+    printf 'token=LEAK\n'  > "$REPO/.npmrc"
+    printf 'LEAK\n'        > "$REPO/secrets/a.txt"
+    printf '{"p":1,"t":"LEAK"}\n' > "$REPO/.claude/settings.json"
+
+    # Untracked secrets.
+    printf 'SECRET=LEAK\n'  > "$REPO/.env"
+    printf '{"l":"LEAK"}\n' > "$REPO/.claude/settings.local.json"
+    printf '{"t":"LEAK"}\n' > "$REPO/secrets.json"
+    mkdir -p "$REPO/.ssh"
+    printf 'LEAK\n'        > "$REPO/.ssh/id_rsa"
+
+    # No secrets, and files outside the search.
     printf 'EXAMPLE=1\n'   > "$REPO/.env.example"
     printf 'SECRET=1\n'    > "$REPO/node_modules/.env"
     printf 'SECRET=1\n'    > "$REPO/deep/1/2/3/4/.env"
     printf 'SECRET=1\n'    > "$REPO/deep/1/2/3/4/5/.env"
+
+    # Real work, which must stay visible.
     printf 'work\n'       >> "$REPO/main.txt"
     printf 'new\n'         > "$REPO/newfile.txt"
 }
@@ -93,7 +215,6 @@ run_wrapper_on_a_terminal() {
 
 build_fixture
 run_wrapper "$REPO"
-SNAPSHOT="$(ls -d "$REPO/.git/claude-session."* 2>/dev/null | head -1)"
 
 requirement "Invocation"
 check "passes the user's arguments through"        has_arg "explain this codebase"
@@ -123,46 +244,103 @@ check "working directory in the workspace"         has_spec ":/home/claude/works
 check "starts in the workspace"                    has_arg "/home/claude/workspace/repo"
 check "no separate credentials mount"              lacks_spec 'credentials'
 check "planning dir mounted into the workspace"    has_spec ":/home/claude/workspace/repo/planning$"
+check "the exclusion list reaches the container"   has_spec '^CLAUDE_MASK_DIR=/home/claude/\.mask/session\.[0-9]+$'
 
-requirement "Secret masking"
-check "secret file reads as empty"                 has_spec '^/dev/null:.*/repo/\.env:ro$'
-check "secret .json reads as {}"                   has_spec '^.*/\.mask/empty\.json:.*/settings\.json:ro$'
-check "secret directory reads as empty"            has_spec '/repo/secrets:ro,noexec,nosuid,nodev$'
-check "template stays visible"                     lacks_spec '\.env\.example'
+requirement "Secret paths are not mounted"
+materialize_workspace
+check "a secret file has no host source"           has_spec '^/dev/null:/home/claude/workspace/repo/\.env$'
+check "a secret directory is an empty mount"       has_spec '^.*/session\.[0-9]+/empty\.[0-9]+:/home/claude/workspace/repo/secrets$'
+check "a settings directory is an empty mount"     has_spec '^.*/session\.[0-9]+/empty\.[0-9]+:/home/claude/workspace/repo/\.claude$'
+check "the empty mount comes before its entries"   test "$(line_of '/repo/\.claude$')" -lt "$(line_of '/repo/\.claude/commands$')"
+check "the tracked settings file is gone"          test ! -e "$MOUNTED/.claude/settings.json"
+check "the local settings file is gone"            test ! -e "$MOUNTED/.claude/settings.local.json"
+check "the other settings entries stay live"       test -f "$MOUNTED/.claude/commands/hello.md"
+check "a secret file reads as empty"               test ! -s "$MOUNTED/.env"
+check "a secret directory reads as empty"          test -z "$(ls -A "$MOUNTED/secrets")"
+check "no secret content reaches the container"    no_secret_leak
+check "no mask is read-only, thus writes are lost" lacks_spec '^/dev/null:.*:ro$|:noexec,nosuid,nodev,ro$'
+check "template stays visible"                     test -s "$MOUNTED/.env.example"
 check "skipped directories are not scanned"        lacks_spec 'node_modules'
-check "masks within the search depth"              has_spec '/repo/deep/1/2/3/4/\.env:ro$'
+check "masks within the search depth"              has_spec '/repo/deep/1/2/3/4/\.env$'
 check "nothing deeper than the search depth"       lacks_spec '/repo/deep/1/2/3/4/5/\.env'
 check "masks overlay the mounts above them"        test "$(line_of '/repo/\.git:ro')" -lt "$(line_of '^/dev/null:')"
 
-requirement "Git"
-check "the container's .git is a session snapshot" has_spec 'claude-session\..*:/home/claude/workspace/repo/\.git:ro'
-check "reading history works"                      container_git log --oneline
-check "no masked path is reported"                 status_hides '\.env$|\.npmrc|secrets/|settings\.json'
-check "the planning mount is not reported"         status_hides 'planning'
-check "planning's .git is also a session snapshot" has_spec 'claude-session\..*:/home/claude/workspace/repo/planning/\.git:ro'
-check "a real edit is still reported"              status_shows '^ M main\.txt$'
-check "a real new file is still reported"          status_shows '^\?\? newfile\.txt$'
+requirement "The exclusion list"
+check "it names the tracked secret file"           excludes "^$MOUNTED	\.npmrc$"
+check "it names the tracked settings file"         excludes "^$MOUNTED	\.claude/settings\.json$"
+check "it names an untracked secret"               excludes "^$MOUNTED	\.env$"
+check "it names the secret directory"              excludes "^$MOUNTED	secrets$"
+check "it names the paths of the planning repo"    excludes "^$MOUNTED/planning	"
+check "it names a remounted neighbour"             excludes "^$MOUNTED	\.claude/skills$"
 
-chmod -R a-w "$SNAPSHOT"
-check "committing fails on the read-only copy"     write_fails
-chmod -R u+w "$SNAPSHOT"
+requirement "Git state"
+check "the container's .git is the host's own"     has_spec "^$REPO/\.git:/home/claude/workspace/repo/\.git:ro$"
+check "no copy of the git directory is made"       lacks_spec 'claude-session'
+check "planning's .git is the host's own too"      has_spec ":/home/claude/workspace/repo/planning/\.git:ro$"
+check "an exclude file overlays the repo's"        has_spec ':/home/claude/workspace/repo/\.git/info/exclude:ro$'
+check "reading history works"                      container_git log --oneline
+check "a real edit is reported"                    status_shows '^ M main\.txt$'
+check "a real new file is reported"                status_shows '^\?\? newfile\.txt$'
+check "no excluded path is reported"               no_excluded_path_reported
+check "the planning mount is not reported"         status_hides 'planning'
+check "the planning repo hides its own secret"     planning_status_hides '\.env'
+check "the planning repo reports its own work"     planning_git status --short --untracked-files=all
+check "git without the shim would report them"     plain_git_reports "settings\.json"
+check "the remounted link is a type change"        plain_git_reports "skills"
+
+chmod -R a-w "$REPO/.git"
+check "reading works on the read-only git dir"     git -C "$REPO" status --short
+check "committing fails on the read-only git dir"  host_write_fails
+chmod -R u+w "$REPO/.git"
+
+requirement "Host git work during a session"
+# The private index of the shim exists before the host moves, thus the shim
+# must notice the change and build it again.
+container_git status --short > /dev/null
+git -C "$REPO" checkout -q -b other
+printf 'other\n' > "$REPO/other.txt"
+git -C "$REPO" add other.txt
+git -C "$REPO" commit -qm other
+KEEP_GIT_STATE=1 materialize_workspace
+check "the private index is not stale"             test -f "$TMP/gitstate/$(printf '%s' "$MOUNTED" | tr / _)/index"
+check "a host branch switch is visible"            test "$(container_git rev-parse --abbrev-ref HEAD)" = other
+check "a host commit is visible"                   test "$(container_git log -1 --format=%s)" = other
+check "the new branch's file is not phantom work"  status_hides 'other\.txt'
+check "real work is still reported"                status_shows '^ M main\.txt$'
+check "no excluded path is reported"               no_excluded_path_reported
 
 HOST_INDEX="$(md5sum "$REPO/.git/index" | cut -d' ' -f1)"
 HOST_EXCLUDE="$(md5sum "$REPO/.git/info/exclude" | cut -d' ' -f1)"
+container_git status --short > /dev/null
 run_wrapper "$REPO"
 check "the host index is never written" \
     test "$HOST_INDEX" = "$(md5sum "$REPO/.git/index" | cut -d' ' -f1)"
 check "the host exclude file is never written" \
     test "$HOST_EXCLUDE" = "$(md5sum "$REPO/.git/info/exclude" | cut -d' ' -f1)"
 
-requirement "Parallel sessions in one code base"
-tail -f /dev/null & LIVE_SESSION=$!
-mkdir -p "$REPO/.git/claude-session.$LIVE_SESSION"
+requirement "A clean repository stays clean"
+# Only the excluded paths differ from HEAD here. Nothing may show up.
+build_fixture
+printf '%s\n' .env .env.example .ssh/ secrets.json node_modules/ deep/ \
+    .claude/settings.local.json > "$REPO/.gitignore"
+git -C "$REPO" add .gitignore
+git -C "$REPO" commit -qm ignore
+git -C "$REPO" checkout -q -- main.txt
+rm -f "$REPO/newfile.txt"
 run_wrapper "$REPO"
-check "a running session's snapshot is kept"       test -d "$REPO/.git/claude-session.$LIVE_SESSION"
+materialize_workspace
+check "git reports nothing at all"                 status_is_clean
+
+requirement "Parallel sessions in one code base"
+build_fixture
+tail -f /dev/null & LIVE_SESSION=$!
+mkdir -p "$MASK_DIR/session.$LIVE_SESSION" "$REPO/.git/claude-session.$LIVE_SESSION"
+run_wrapper "$REPO"
+check "a running session's files are kept"         test -d "$MASK_DIR/session.$LIVE_SESSION"
+check "a copy from an older wrapper is removed"    test ! -d "$REPO/.git/claude-session.$LIVE_SESSION"
 kill "$LIVE_SESSION" 2>/dev/null
 run_wrapper "$REPO"
-check "a finished session's snapshot is removed"   test ! -d "$REPO/.git/claude-session.$LIVE_SESSION"
+check "a finished session's files are removed"     test ! -d "$MASK_DIR/session.$LIVE_SESSION"
 
 requirement "Directories that are not repositories"
 run_wrapper "$TMP/plain"; PLAIN_EXIT=$?
@@ -172,10 +350,79 @@ check "no .git mount without a repository"         lacks_spec ':/home/claude/wor
 requirement "SELinux labels"
 run_wrapper "$REPO" "$TMP/selinux-bin"
 check "host paths get the shared label"            has_spec ':/home/claude:z$'
-check "the git snapshot keeps read-only plus it"   has_spec '/repo/\.git:ro,z$'
-check "masks are never relabeled"                  lacks_spec '^/dev/null:.*:ro,z$|:ro,noexec,nosuid,nodev,z$'
+check "the git dir keeps read-only plus it"        has_spec '/repo/\.git:ro,z$'
+check "masks are never relabeled"                  lacks_spec '^/dev/null:.*:z$|:noexec,nosuid,nodev,z$'
 run_wrapper "$REPO"
 check "no labels when SELinux is off"              lacks_spec ':z$|,z$'
+
+requirement "Showing the command"
+check "prints it and starts no container"          prints_its_command
+
+# ── One real container ────────────────────────────────────────────────────────
+# The checks above read the arguments of podman. Only a container shows what
+# the kernel makes of them, thus this section runs one and reads the result.
+PROBE='
+cd /home/claude/workspace/repo || exit 1
+printf "claude_entries=%s\n" "$(ls -A .claude 2>&1 | tr "\n" " ")"
+printf "env_bytes=%s\n"      "$(wc -c < .env 2>&1)"
+printf "secret_entries=%s\n" "$(ls -A secrets 2>&1 | tr "\n" " ")"
+printf "secret_fs=%s\n"      "$(stat -f -c %T secrets 2>&1)"
+printf "skills_type=%s\n"    "$(stat -c %F .claude/skills 2>&1)"
+printf "git_binary=%s\n"     "$(command -v git)"
+printf "status=%s\n"         "$(git status --short 2>&1 | tr "\n" ";")"
+git add newfile.txt >/dev/null 2>&1 && printf "git_write=allowed\n" \
+                                    || printf "git_write=refused\n"
+printf "write_to_secret=%s\n" "$(echo probe > .env 2>&1 && wc -c < .env)"
+'
+
+run_probe() {
+    local -a printed=() command=()
+    local argument
+    # No terminal, thus podman adds no -it and the output holds no carriage
+    # returns.
+    mapfile -t printed < <( cd "$REPO" \
+        && HOME="$TMP/home" PATH="$TMP/bin:$PATH" \
+           CLAUDE_PRINT_COMMAND=1 bash "$WRAPPER" 2>/dev/null < /dev/null )
+    for argument in "${printed[@]}"; do
+        [[ "$argument" == "claude-cli:latest" ]] && break
+        command+=("$argument")
+    done
+    (( ${#command[@]} )) || return 1
+    "${command[@]}" --entrypoint /bin/sh claude-cli:latest -c "$PROBE" \
+        > "$TMP/probe" 2>&1 < /dev/null
+}
+
+probe_says() { grep -qE -- "$1" "$TMP/probe"; }
+probe_denies() { ! grep -qE -- "$1" "$TMP/probe"; }
+
+requirement "One real container"
+if ! command -v podman > /dev/null 2>&1; then
+    skip "the container's own view" "podman is not available here"
+elif ! podman image exists "claude-cli:latest" 2>/dev/null; then
+    skip "the container's own view" "run ./rebuild-claude-container first"
+else
+    build_fixture
+    run_probe
+    BEFORE_PROBE=$FAILURES
+    check "the probe ran"                          test -s "$TMP/probe"
+    check "the settings file is not there"         probe_denies '^claude_entries=.*settings\.json'
+    check "the other settings entries are there"   probe_says '^claude_entries=.*commands'
+    check "a secret file reads as empty"           probe_says '^env_bytes=0$'
+    check "a secret directory reads as empty"      probe_says '^secret_entries=$'
+    check "a write to a secret file is lost"       probe_says '^write_to_secret=0$'
+    check "git is the shim"                        probe_says '^git_binary=/usr/local/bin/git$'
+    check "a real edit is reported"                probe_says '^status=.*M main\.txt'
+    # Each status entry ends at a ";", thus .env.example cannot count as .env.
+    # A status entry ends at a ";". An excluded name must end there too, or go
+    # on with a "/", thus .env.example does not count as .env.
+    check "no excluded path is reported"           probe_denies '^status=.*[ /](\.env|\.npmrc|secrets|secrets\.json|\.ssh)(/[^;]*)?;|^status=.*[ /]\.claude/[^;]*;'
+    check "the mask keeps its place"               probe_says '^secret_fs='
+    check "committing is refused"                  probe_says '^git_write=refused$'
+    if (( FAILURES > BEFORE_PROBE )); then
+        printf '\n  the container said:\n'
+        sed 's/^/    /' "$TMP/probe"
+    fi
+fi
 
 printf '\n'
 if (( FAILURES )); then
