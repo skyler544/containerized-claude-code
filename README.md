@@ -20,6 +20,10 @@ ln -s "$HOME/build/programming/containerized-agents/codex" "$HOME/.local/bin/cod
 ln -s "$HOME/build/programming/containerized-agents/codex-acp" "$HOME/.local/bin/codex-acp"
 ```
 
+After a successful build, the rebuild script removes the prior
+`codex-cli:latest` image if it has no other tag. It does not prune unrelated
+images.
+
 Run `codex` from the project directory you want it to edit:
 
 ```sh

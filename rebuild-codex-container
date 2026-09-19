@@ -2,7 +2,24 @@
 set -euo pipefail
 
 SCRIPT_DIR="$HOME/build/programming/containerized-agents/"
-podman build --no-cache \
+old_image_id="$(podman image inspect --format '{{.Id}}' codex-cli:latest 2>/dev/null || true)"
+
+podman build --layers=false \
 	--tag codex-cli:latest \
 	--file "$SCRIPT_DIR/Containerfile" \
 	"$SCRIPT_DIR"
+
+new_image_id="$(podman image inspect --format '{{.Id}}' codex-cli:latest)"
+if [[ -n "$old_image_id" && "$old_image_id" != "$new_image_id" ]]; then
+	old_image_is_dangling=false
+	while IFS= read -r dangling_image_id; do
+		if [[ "${dangling_image_id#sha256:}" == "${old_image_id#sha256:}" ]]; then
+			old_image_is_dangling=true
+			break
+		fi
+	done < <(podman image ls --filter dangling=true --no-trunc --quiet)
+
+	if "$old_image_is_dangling"; then
+		podman image rm "$old_image_id"
+	fi
+fi
