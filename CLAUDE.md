@@ -13,3 +13,4 @@ You are running in an alpine linux container with a limited set of shell program
 - Never try to use python scripts to accomplish an edit task.
 - Never try to run a command that would have to run on the actual host: remember, you are running in a container.
 - Never use the pattern `cd /some/directory; grep ...`, just grep in the right place from the start
+- Do not write comments that restate the code.
