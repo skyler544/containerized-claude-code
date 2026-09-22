@@ -243,6 +243,8 @@ check "session state at /home/claude"              has_spec ":/home/claude$"
 check "working directory in the workspace"         has_spec ":/home/claude/workspace/repo$"
 check "starts in the workspace"                    has_arg "/home/claude/workspace/repo"
 check "no separate credentials mount"              lacks_spec 'credentials'
+check "the repo's rules file is the agent's"       has_spec "^$HERE/CLAUDE\.md:/home/claude/\.claude/CLAUDE\.md:ro"
+check "the rules file overlays the home mount"     test "$(line_of ':/home/claude$')" -lt "$(line_of '/\.claude/CLAUDE\.md:ro')"
 check "planning dir mounted into the workspace"    has_spec ":/home/claude/workspace/repo/planning$"
 check "the exclusion list reaches the container"   has_spec '^CLAUDE_MASK_DIR=/home/claude/\.mask/session\.[0-9]+$'
 
