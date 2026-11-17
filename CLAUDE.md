@@ -30,6 +30,9 @@ Never write a script to change a file.
 Give grep the correct path in the first call. Never write
 `cd /some/directory; grep ...`.
 
+State-changing git commands are off-limits to you. Do not probe for ways around
+this. You may use git only to examine history or other branches.
+
 ## Comments
 
 Do not write a comment that repeats the code.
